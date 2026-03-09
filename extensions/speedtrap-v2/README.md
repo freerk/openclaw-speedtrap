@@ -2,6 +2,42 @@
 
 Speedtrap prevents **thundering herd** and **cascade** behavior in multi-agent channels. The core insight: if the channel moved while an agent was thinking, its response is stale — drop it.
 
+## Installation
+
+### From npm
+
+```sh
+openclaw plugin install @openclaw/speedtrap
+```
+
+### Manual (monorepo)
+
+The plugin lives at `extensions/speedtrap-v2/`. If you're running from a git checkout, it's already available — just enable it in your config.
+
+## Enable / Disable
+
+```sh
+# Enable
+openclaw config set plugins.entries.speedtrap.enabled true
+
+# Disable
+openclaw config set plugins.entries.speedtrap.enabled false
+```
+
+Or edit your config file directly (`~/.openclaw/config.json`):
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "speedtrap": {
+        "enabled": true
+      }
+    }
+  }
+}
+```
+
 ## The Problem
 
 With N agents on the same channel:
@@ -64,6 +100,13 @@ Tools are classified as read or write using:
 | ----------------------------- | ------- | -------------------------------------------------------------------------------------- |
 | `assumeUnknownToolsAreWrites` | `true`  | Unknown tools assumed to have write side effects (forces reinject instead of suppress) |
 | `debug`                       | `true`  | Log all decisions to console                                                           |
+
+You can also set these via the CLI:
+
+```sh
+openclaw config set plugins.entries.speedtrap.config.debug true
+openclaw config set plugins.entries.speedtrap.config.assumeUnknownToolsAreWrites false
+```
 
 ## Architecture
 
