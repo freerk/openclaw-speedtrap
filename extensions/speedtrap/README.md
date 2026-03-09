@@ -14,6 +14,31 @@ openclaw plugin install @openclaw/speedtrap
 
 The plugin lives at `extensions/speedtrap/`. If you're running from a git checkout, it's already available — just enable it in your config.
 
+### Manual (standalone)
+
+If you're running OpenClaw from a global npm install (e.g. on a VPS) and the plugin isn't on npm yet, you can clone it directly:
+
+```sh
+git clone https://github.com/openclaw/openclaw /tmp/openclaw-src
+cp -r /tmp/openclaw-src/extensions/speedtrap ~/.openclaw/plugins/speedtrap
+rm -rf /tmp/openclaw-src
+```
+
+Then register it in your config (`~/.openclaw/config.json`):
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "speedtrap": {
+        "enabled": true,
+        "path": "~/.openclaw/plugins/speedtrap"
+      }
+    }
+  }
+}
+```
+
 ## Enable / Disable
 
 ```sh
