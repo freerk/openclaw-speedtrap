@@ -7,6 +7,7 @@ Docs: https://docs.openclaw.ai
 ### Changes
 
 - Gateway/node pending work: add narrow in-memory pending-work queue primitives (`node.pending.enqueue` / `node.pending.drain`) and wake-helper reuse as a foundation for dormant-node work delivery. (#41409) Thanks @mbelinky.
+- Slack/Socket Mode: expose `socketMode.clientPingTimeout`, `socketMode.serverPingTimeout`, and `socketMode.pingPongLoggingEnabled` config to tune the underlying `@slack/socket-mode` client. The SDK default `clientPingTimeout` of 5000 ms causes excessive pong-timeout warnings in production. Fixes #14248.
 
 ### Breaking
 
