@@ -1,22 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { SpeedtrapV2Coordinator } from "./coordinator.js";
-import type { SpeedtrapV2Config } from "./types.js";
+import { SpeedtrapCoordinator } from "./coordinator.js";
+import type { SpeedtrapConfig } from "./types.js";
 
-function createCoordinator(overrides: Partial<SpeedtrapV2Config> = {}): {
-  coordinator: SpeedtrapV2Coordinator;
+function createCoordinator(overrides: Partial<SpeedtrapConfig> = {}): {
+  coordinator: SpeedtrapCoordinator;
   logs: string[];
 } {
   const logs: string[] = [];
-  const config: SpeedtrapV2Config = {
+  const config: SpeedtrapConfig = {
     assumeUnknownToolsAreWrites: true,
     debug: true,
     ...overrides,
   };
-  const coordinator = new SpeedtrapV2Coordinator(config, (msg) => logs.push(msg));
+  const coordinator = new SpeedtrapCoordinator(config, (msg) => logs.push(msg));
   return { coordinator, logs };
 }
 
-describe("SpeedtrapV2Coordinator", () => {
+describe("SpeedtrapCoordinator", () => {
   describe("channel unchanged → deliver", () => {
     it("delivers when no new messages arrived", () => {
       const { coordinator } = createCoordinator();

@@ -1,5 +1,5 @@
 /**
- * Speedtrap v2 Plugin — Discard Stale Responses
+ * Speedtrap Plugin — Discard Stale Responses
  *
  * If the channel moved while an agent was thinking, its response is stale —
  * drop it. If the agent executed write operations, reinject so it can revise
@@ -18,12 +18,12 @@
  */
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/speedtrap";
-import { SpeedtrapV2Coordinator } from "./coordinator.js";
-import { DEFAULT_CONFIG, type SpeedtrapV2Config } from "./types.js";
+import { SpeedtrapCoordinator } from "./coordinator.js";
+import { DEFAULT_CONFIG, type SpeedtrapConfig } from "./types.js";
 
 export default function register(api: OpenClawPluginApi) {
-  const pluginCfg = (api.pluginConfig ?? {}) as Partial<SpeedtrapV2Config>;
-  const config: SpeedtrapV2Config = {
+  const pluginCfg = (api.pluginConfig ?? {}) as Partial<SpeedtrapConfig>;
+  const config: SpeedtrapConfig = {
     assumeUnknownToolsAreWrites:
       pluginCfg.assumeUnknownToolsAreWrites ?? DEFAULT_CONFIG.assumeUnknownToolsAreWrites,
     debug: pluginCfg.debug ?? DEFAULT_CONFIG.debug,
@@ -35,7 +35,7 @@ export default function register(api: OpenClawPluginApi) {
     }
   };
 
-  const coordinator = new SpeedtrapV2Coordinator(config, log);
+  const coordinator = new SpeedtrapCoordinator(config, log);
 
   // ---------------------------------------------------------------------------
   // message_received: update channel timestamp

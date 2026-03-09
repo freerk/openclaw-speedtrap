@@ -1,5 +1,5 @@
 /**
- * Speedtrap v2 Coordinator
+ * Speedtrap Coordinator
  *
  * Minimal state manager: tracks per-channel message timestamps and
  * per-agent-run metadata. Three possible outcomes:
@@ -11,15 +11,15 @@
  */
 
 import { isWriteTool } from "./classifier.js";
-import type { AgentRunState, ChannelState, SpeedtrapDecision, SpeedtrapV2Config } from "./types.js";
+import type { AgentRunState, ChannelState, SpeedtrapDecision, SpeedtrapConfig } from "./types.js";
 
-export class SpeedtrapV2Coordinator {
+export class SpeedtrapCoordinator {
   private channels = new Map<string, ChannelState>();
   private agentRuns = new Map<string, AgentRunState>();
-  private config: SpeedtrapV2Config;
+  private config: SpeedtrapConfig;
   private log: (msg: string) => void;
 
-  constructor(config: SpeedtrapV2Config, log: (msg: string) => void) {
+  constructor(config: SpeedtrapConfig, log: (msg: string) => void) {
     this.config = config;
     this.log = log;
   }

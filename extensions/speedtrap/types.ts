@@ -1,10 +1,10 @@
 /**
- * Speedtrap v2 — Types
+ * Speedtrap — Types
  *
  * Minimal state model: per-channel timestamps + per-agent-run metadata.
  */
 
-export type SpeedtrapV2Config = {
+export type SpeedtrapConfig = {
   /**
    * When true (default), unknown tools are assumed to have write side effects.
    * This is the conservative default — unknown tools force delivery even if
@@ -16,7 +16,7 @@ export type SpeedtrapV2Config = {
   debug: boolean;
 };
 
-export const DEFAULT_CONFIG: SpeedtrapV2Config = {
+export const DEFAULT_CONFIG: SpeedtrapConfig = {
   assumeUnknownToolsAreWrites: true,
   debug: true,
 };

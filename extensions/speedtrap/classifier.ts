@@ -1,5 +1,5 @@
 /**
- * Speedtrap v2 — Tool Side-Effect Classifier
+ * Speedtrap — Tool Side-Effect Classifier
  *
  * Determines whether a tool call is read-only (safe to discard) or has
  * write side effects (must force delivery). Conservative default: unknown
