@@ -1254,6 +1254,7 @@ export type PluginHookName =
   | "before_model_resolve"
   | "before_prompt_build"
   | "before_agent_start"
+  | "after_agent_complete"
   | "llm_input"
   | "llm_output"
   | "agent_end"
@@ -1281,6 +1282,7 @@ export const PLUGIN_HOOK_NAMES = [
   "before_model_resolve",
   "before_prompt_build",
   "before_agent_start",
+  "after_agent_complete",
   "llm_input",
   "llm_output",
   "agent_end",
@@ -1419,6 +1421,31 @@ export const stripPromptMutationFieldsFromLegacyHookResult = (
   return Object.keys(remaining).length > 0
     ? (remaining as PluginHookBeforeAgentStartOverrideResult)
     : undefined;
+};
+
+// after_agent_complete hook — fires after agent produces a response, before delivery
+export type PluginHookAfterAgentCompleteEvent = {
+  sessionKey: string;
+  channelId: string;
+  channelKey: string;
+  agentId: string;
+  response: string;
+  processingStartedAt: number;
+  messageIdAtStart?: string;
+  toolCallsMade: PluginHookToolCallRecord[];
+};
+
+export type PluginHookToolCallRecord = {
+  toolName: string;
+  input: Record<string, unknown>;
+  output: string;
+  hasSideEffect: boolean;
+};
+
+export type PluginHookAfterAgentCompleteResult = {
+  reinject?: boolean;
+  injectContext?: string;
+  suppress?: boolean;
 };
 
 // llm_input hook
@@ -1765,6 +1792,13 @@ export type PluginHookHandlerMap = {
     event: PluginHookBeforeAgentStartEvent,
     ctx: PluginHookAgentContext,
   ) => Promise<PluginHookBeforeAgentStartResult | void> | PluginHookBeforeAgentStartResult | void;
+  after_agent_complete: (
+    event: PluginHookAfterAgentCompleteEvent,
+    ctx: PluginHookAgentContext,
+  ) =>
+    | Promise<PluginHookAfterAgentCompleteResult | void>
+    | PluginHookAfterAgentCompleteResult
+    | void;
   llm_input: (event: PluginHookLlmInputEvent, ctx: PluginHookAgentContext) => Promise<void> | void;
   llm_output: (
     event: PluginHookLlmOutputEvent,
