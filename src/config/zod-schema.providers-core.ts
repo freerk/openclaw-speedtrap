@@ -911,6 +911,14 @@ export const SlackAccountSchema = z
     responsePrefix: z.string().optional(),
     ackReaction: z.string().optional(),
     typingReaction: z.string().optional(),
+    socketMode: z
+      .object({
+        clientPingTimeout: z.number().int().positive().optional(),
+        serverPingTimeout: z.number().int().positive().optional(),
+        pingPongLoggingEnabled: z.boolean().optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .superRefine((value) => {
