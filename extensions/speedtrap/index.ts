@@ -42,7 +42,7 @@ export default function register(api: OpenClawPluginApi) {
   // message_received: update channel timestamp
   // ---------------------------------------------------------------------------
   api.on("message_received", async (_event, ctx) => {
-    const channelKey = buildChannelKey(ctx.channelId, ctx.accountId, ctx.conversationId);
+    const channelKey = buildPhysicalChannelKey(ctx.channelId, ctx.conversationId);
     coordinator.onMessageReceived(channelKey, Date.now());
   });
 
@@ -66,7 +66,8 @@ export default function register(api: OpenClawPluginApi) {
   // after_agent_complete: deliver / suppress / reinject
   // ---------------------------------------------------------------------------
   api.on("after_agent_complete", async (event, _ctx) => {
-    const decision = coordinator.getDecision(event.agentId, event.channelKey, event.response);
+    const channelKey = stripAccountFromChannelKey(event.channelKey, event.channelId);
+    const decision = coordinator.getDecision(event.agentId, channelKey, event.response);
     if (decision.action === "suppress") {
       return { suppress: true };
     }
@@ -78,9 +79,36 @@ export default function register(api: OpenClawPluginApi) {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers (reused from v1)
+// Channel key normalization
+//
+// Core builds channelKey as [provider, accountId, to].join(":").
+// Multi-agent setups use different accountIds for the same physical channel
+// (e.g. "slack:default:channel:C0..." vs "slack:conor:channel:C0...").
+// Speedtrap needs to treat these as the same channel, so we strip accountId.
+//
+// See CHANNEL_KEY_NORMALIZATION.md for the long-term solution (Option B).
 // ---------------------------------------------------------------------------
 
-function buildChannelKey(channelId: string, accountId?: string, conversationId?: string): string {
-  return [channelId, accountId, conversationId].filter(Boolean).join(":");
+/** Build a physical channel key from message_received components (skip accountId). */
+function buildPhysicalChannelKey(channelId: string, conversationId?: string): string {
+  return [channelId, conversationId].filter(Boolean).join(":");
+}
+
+/**
+ * Strip the accountId segment from a core-built channelKey.
+ *
+ * Core format: "{channelId}:{accountId}:{to}" where channelId = provider name.
+ * We strip the first segment after the provider to produce "{channelId}:{to}",
+ * matching what buildPhysicalChannelKey produces from message_received.
+ *
+ * Assumes accountId is a single segment (no colons). This holds for all known
+ * providers (Slack, Telegram, WhatsApp, Discord, Teams, Matrix, etc.).
+ */
+function stripAccountFromChannelKey(channelKey: string, channelId: string): string {
+  const prefix = `${channelId}:`;
+  if (!channelKey.startsWith(prefix)) return channelKey;
+  const afterProvider = channelKey.slice(prefix.length);
+  const firstColon = afterProvider.indexOf(":");
+  if (firstColon === -1) return channelKey; // no account segment present
+  return `${channelId}:${afterProvider.slice(firstColon + 1)}`;
 }
