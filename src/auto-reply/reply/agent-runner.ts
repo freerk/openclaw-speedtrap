@@ -19,6 +19,8 @@ import { emitAgentEvent } from "../../infra/agent-events.js";
 import { emitDiagnosticEvent, isDiagnosticsEnabled } from "../../infra/diagnostic-events.js";
 import { generateSecureUuid } from "../../infra/secure-random.js";
 import { enqueueSystemEvent } from "../../infra/system-events.js";
+import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
+import type { PluginHookToolCallRecord } from "../../plugins/types.js";
 import { defaultRuntime } from "../../runtime.js";
 import { estimateUsageCost, resolveModelCostConfig } from "../../utils/usage-format.js";
 import {
@@ -92,7 +94,7 @@ export async function runReplyAgent(params: {
   typingMode: TypingMode;
 }): Promise<ReplyPayload | ReplyPayload[] | undefined> {
   const {
-    commandBody,
+    commandBody: originalCommandBody,
     followupRun,
     queueKey,
     resolvedQueue,
@@ -118,6 +120,7 @@ export async function runReplyAgent(params: {
     typingMode,
   } = params;
 
+  let effectiveCommandBody = originalCommandBody;
   let activeSessionEntry = sessionEntry;
   const activeSessionStore = sessionStore;
   let activeIsNewSession = isNewSession;
@@ -169,7 +172,7 @@ export async function runReplyAgent(params: {
           chunking: blockReplyChunking,
         }).coalescing
       : undefined;
-  const blockReplyPipeline =
+  let blockReplyPipeline =
     blockStreamingEnabled && opts?.onBlockReply
       ? createBlockReplyPipeline({
           onBlockReply: opts.onBlockReply,
@@ -339,368 +342,431 @@ export async function runReplyAgent(params: {
       cleanupTranscripts: true,
     });
   try {
-    const runStartedAt = Date.now();
-    const runOutcome = await runAgentTurnWithFallback({
-      commandBody,
-      followupRun,
-      sessionCtx,
-      opts,
-      typingSignals,
-      blockReplyPipeline,
-      blockStreamingEnabled,
-      blockReplyChunking,
-      resolvedBlockStreamingBreak,
-      applyReplyToMode,
-      shouldEmitToolResult,
-      shouldEmitToolOutput,
-      pendingToolTasks,
-      resetSessionAfterCompactionFailure,
-      resetSessionAfterRoleOrderingConflict,
-      isHeartbeat,
-      sessionKey,
-      getActiveSessionEntry: () => activeSessionEntry,
-      activeSessionStore,
-      storePath,
-      resolvedVerboseLevel,
-    });
-
-    if (runOutcome.kind === "final") {
-      return finalizeWithFollowup(runOutcome.payload, queueKey, runFollowupTurn);
-    }
-
-    const {
-      runId,
-      runResult,
-      fallbackProvider,
-      fallbackModel,
-      fallbackAttempts,
-      directlySentBlockKeys,
-    } = runOutcome;
-    let { didLogHeartbeatStrip, autoCompactionCompleted } = runOutcome;
-
-    if (
-      shouldInjectGroupIntro &&
-      activeSessionEntry &&
-      activeSessionStore &&
-      sessionKey &&
-      activeSessionEntry.groupActivationNeedsSystemIntro
-    ) {
-      const updatedAt = Date.now();
-      activeSessionEntry.groupActivationNeedsSystemIntro = false;
-      activeSessionEntry.updatedAt = updatedAt;
-      activeSessionStore[sessionKey] = activeSessionEntry;
-      if (storePath) {
-        await updateSessionStoreEntry({
-          storePath,
-          sessionKey,
-          update: async () => ({
-            groupActivationNeedsSystemIntro: false,
-            updatedAt,
-          }),
-        });
-      }
-    }
-
-    const payloadArray = runResult.payloads ?? [];
-
-    if (blockReplyPipeline) {
-      await blockReplyPipeline.flush({ force: true });
-      blockReplyPipeline.stop();
-    }
-    if (pendingToolTasks.size > 0) {
-      await Promise.allSettled(pendingToolTasks);
-    }
-
-    const usage = runResult.meta?.agentMeta?.usage;
-    const promptTokens = runResult.meta?.agentMeta?.promptTokens;
-    const modelUsed = runResult.meta?.agentMeta?.model ?? fallbackModel ?? defaultModel;
-    const providerUsed =
-      runResult.meta?.agentMeta?.provider ?? fallbackProvider ?? followupRun.run.provider;
-    const verboseEnabled = resolvedVerboseLevel !== "off";
-    const selectedProvider = followupRun.run.provider;
-    const selectedModel = followupRun.run.model;
-    const fallbackStateEntry =
-      activeSessionEntry ?? (sessionKey ? activeSessionStore?.[sessionKey] : undefined);
-    const fallbackTransition = resolveFallbackTransition({
-      selectedProvider,
-      selectedModel,
-      activeProvider: providerUsed,
-      activeModel: modelUsed,
-      attempts: fallbackAttempts,
-      state: fallbackStateEntry,
-    });
-    if (fallbackTransition.stateChanged) {
-      if (fallbackStateEntry) {
-        fallbackStateEntry.fallbackNoticeSelectedModel = fallbackTransition.nextState.selectedModel;
-        fallbackStateEntry.fallbackNoticeActiveModel = fallbackTransition.nextState.activeModel;
-        fallbackStateEntry.fallbackNoticeReason = fallbackTransition.nextState.reason;
-        fallbackStateEntry.updatedAt = Date.now();
-        activeSessionEntry = fallbackStateEntry;
-      }
-      if (sessionKey && fallbackStateEntry && activeSessionStore) {
-        activeSessionStore[sessionKey] = fallbackStateEntry;
-      }
-      if (sessionKey && storePath) {
-        await updateSessionStoreEntry({
-          storePath,
-          sessionKey,
-          update: async () => ({
-            fallbackNoticeSelectedModel: fallbackTransition.nextState.selectedModel,
-            fallbackNoticeActiveModel: fallbackTransition.nextState.activeModel,
-            fallbackNoticeReason: fallbackTransition.nextState.reason,
-          }),
-        });
-      }
-    }
-    const cliSessionId = isCliProvider(providerUsed, cfg)
-      ? runResult.meta?.agentMeta?.sessionId?.trim()
-      : undefined;
-    const contextTokensUsed =
-      agentCfgContextTokens ??
-      lookupContextTokens(modelUsed) ??
-      activeSessionEntry?.contextTokens ??
-      DEFAULT_CONTEXT_TOKENS;
-
-    await persistRunSessionUsage({
-      storePath,
-      sessionKey,
-      usage,
-      lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
-      promptTokens,
-      modelUsed,
-      providerUsed,
-      contextTokensUsed,
-      systemPromptReport: runResult.meta?.systemPromptReport,
-      cliSessionId,
-    });
-
-    // Drain any late tool/block deliveries before deciding there's "nothing to send".
-    // Otherwise, a late typing trigger (e.g. from a tool callback) can outlive the run and
-    // keep the typing indicator stuck.
-    if (payloadArray.length === 0) {
-      return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
-    }
-
-    const payloadResult = await buildReplyPayloads({
-      payloads: payloadArray,
-      isHeartbeat,
-      didLogHeartbeatStrip,
-      blockStreamingEnabled,
-      blockReplyPipeline,
-      directlySentBlockKeys,
-      replyToMode,
-      replyToChannel,
-      currentMessageId: sessionCtx.MessageSidFull ?? sessionCtx.MessageSid,
-      messageProvider: followupRun.run.messageProvider,
-      messagingToolSentTexts: runResult.messagingToolSentTexts,
-      messagingToolSentMediaUrls: runResult.messagingToolSentMediaUrls,
-      messagingToolSentTargets: runResult.messagingToolSentTargets,
-      originatingChannel: sessionCtx.OriginatingChannel,
-      originatingTo: resolveOriginMessageTo({
-        originatingTo: sessionCtx.OriginatingTo,
-        to: sessionCtx.To,
-      }),
-      accountId: sessionCtx.AccountId,
-      normalizeMediaPaths: normalizeReplyMediaPaths,
-    });
-    const { replyPayloads } = payloadResult;
-    didLogHeartbeatStrip = payloadResult.didLogHeartbeatStrip;
-
-    if (replyPayloads.length === 0) {
-      return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
-    }
-
-    const successfulCronAdds = runResult.successfulCronAdds ?? 0;
-    const hasReminderCommitment = replyPayloads.some(
-      (payload) =>
-        !payload.isError &&
-        typeof payload.text === "string" &&
-        hasUnbackedReminderCommitment(payload.text),
-    );
-    // Suppress the guard note when an existing cron job (created in a prior
-    // turn) already covers the commitment — avoids false positives (#32228).
-    const coveredByExistingCron =
-      hasReminderCommitment && successfulCronAdds === 0
-        ? await hasSessionRelatedCronJobs({
-            cronStorePath: cfg.cron?.store,
-            sessionKey,
-          })
-        : false;
-    const guardedReplyPayloads =
-      hasReminderCommitment && successfulCronAdds === 0 && !coveredByExistingCron
-        ? appendUnscheduledReminderNote(replyPayloads)
-        : replyPayloads;
-
-    await signalTypingIfNeeded(guardedReplyPayloads, typingSignals);
-
-    if (isDiagnosticsEnabled(cfg) && hasNonzeroUsage(usage)) {
-      const input = usage.input ?? 0;
-      const output = usage.output ?? 0;
-      const cacheRead = usage.cacheRead ?? 0;
-      const cacheWrite = usage.cacheWrite ?? 0;
-      const promptTokens = input + cacheRead + cacheWrite;
-      const totalTokens = usage.total ?? promptTokens + output;
-      const costConfig = resolveModelCostConfig({
-        provider: providerUsed,
-        model: modelUsed,
-        config: cfg,
-      });
-      const costUsd = estimateUsageCost({ usage, cost: costConfig });
-      emitDiagnosticEvent({
-        type: "model.usage",
+    // after_agent_complete hook loop: plugins can return reinject=true to re-run
+    // the agent with updated context. The plugin owns retry budgeting — core only
+    // enforces a hard safety cap against infinite loops from buggy plugins.
+    const HOOK_REINJECT_SAFETY_CAP = 5;
+    let hookReinjectCount = 0;
+    reinjectLoop: while (true) {
+      const runStartedAt = Date.now();
+      const runOutcome = await runAgentTurnWithFallback({
+        commandBody: effectiveCommandBody,
+        followupRun,
+        sessionCtx,
+        opts,
+        typingSignals,
+        blockReplyPipeline,
+        blockStreamingEnabled,
+        blockReplyChunking,
+        resolvedBlockStreamingBreak,
+        applyReplyToMode,
+        shouldEmitToolResult,
+        shouldEmitToolOutput,
+        pendingToolTasks,
+        resetSessionAfterCompactionFailure,
+        resetSessionAfterRoleOrderingConflict,
+        isHeartbeat,
         sessionKey,
-        sessionId: followupRun.run.sessionId,
-        channel: replyToChannel,
-        provider: providerUsed,
-        model: modelUsed,
-        usage: {
-          input,
-          output,
-          cacheRead,
-          cacheWrite,
-          promptTokens,
-          total: totalTokens,
-        },
-        lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
-        context: {
-          limit: contextTokensUsed,
-          used: totalTokens,
-        },
-        costUsd,
-        durationMs: Date.now() - runStartedAt,
+        getActiveSessionEntry: () => activeSessionEntry,
+        activeSessionStore,
+        storePath,
+        resolvedVerboseLevel,
       });
-    }
 
-    const responseUsageRaw =
-      activeSessionEntry?.responseUsage ??
-      (sessionKey ? activeSessionStore?.[sessionKey]?.responseUsage : undefined);
-    const responseUsageMode = resolveResponseUsageMode(responseUsageRaw);
-    if (responseUsageMode !== "off" && hasNonzeroUsage(usage)) {
-      const authMode = resolveModelAuthMode(providerUsed, cfg);
-      const showCost = authMode === "api-key";
-      const costConfig = showCost
-        ? resolveModelCostConfig({
-            provider: providerUsed,
-            model: modelUsed,
-            config: cfg,
-          })
-        : undefined;
-      let formatted = formatResponseUsageLine({
-        usage,
-        showCost,
-        costConfig,
-      });
-      if (formatted && responseUsageMode === "full" && sessionKey) {
-        formatted = `${formatted} · session \`${sessionKey}\``;
+      if (runOutcome.kind === "final") {
+        return finalizeWithFollowup(runOutcome.payload, queueKey, runFollowupTurn);
       }
-      if (formatted) {
-        responseUsageLine = formatted;
-      }
-    }
 
-    // If verbose is enabled, prepend operational run notices.
-    let finalPayloads = guardedReplyPayloads;
-    const verboseNotices: ReplyPayload[] = [];
-
-    if (verboseEnabled && activeIsNewSession) {
-      verboseNotices.push({ text: `🧭 New session: ${followupRun.run.sessionId}` });
-    }
-
-    if (fallbackTransition.fallbackTransitioned) {
-      emitAgentEvent({
+      const {
         runId,
-        sessionKey,
-        stream: "lifecycle",
-        data: {
-          phase: "fallback",
-          selectedProvider,
-          selectedModel,
-          activeProvider: providerUsed,
-          activeModel: modelUsed,
-          reasonSummary: fallbackTransition.reasonSummary,
-          attemptSummaries: fallbackTransition.attemptSummaries,
-          attempts: fallbackAttempts,
-        },
-      });
-      if (verboseEnabled) {
-        const fallbackNotice = buildFallbackNotice({
-          selectedProvider,
-          selectedModel,
-          activeProvider: providerUsed,
-          activeModel: modelUsed,
-          attempts: fallbackAttempts,
-        });
-        if (fallbackNotice) {
-          verboseNotices.push({ text: fallbackNotice });
+        runResult,
+        fallbackProvider,
+        fallbackModel,
+        fallbackAttempts,
+        directlySentBlockKeys,
+      } = runOutcome;
+      let { didLogHeartbeatStrip, autoCompactionCompleted } = runOutcome;
+
+      if (
+        shouldInjectGroupIntro &&
+        activeSessionEntry &&
+        activeSessionStore &&
+        sessionKey &&
+        activeSessionEntry.groupActivationNeedsSystemIntro
+      ) {
+        const updatedAt = Date.now();
+        activeSessionEntry.groupActivationNeedsSystemIntro = false;
+        activeSessionEntry.updatedAt = updatedAt;
+        activeSessionStore[sessionKey] = activeSessionEntry;
+        if (storePath) {
+          await updateSessionStoreEntry({
+            storePath,
+            sessionKey,
+            update: async () => ({
+              groupActivationNeedsSystemIntro: false,
+              updatedAt,
+            }),
+          });
         }
       }
-    }
-    if (fallbackTransition.fallbackCleared) {
-      emitAgentEvent({
-        runId,
-        sessionKey,
-        stream: "lifecycle",
-        data: {
-          phase: "fallback_cleared",
-          selectedProvider,
-          selectedModel,
-          activeProvider: providerUsed,
-          activeModel: modelUsed,
-          previousActiveModel: fallbackTransition.previousState.activeModel,
-        },
+
+      const payloadArray = runResult.payloads ?? [];
+
+      if (blockReplyPipeline) {
+        await blockReplyPipeline.flush({ force: true });
+        blockReplyPipeline.stop();
+      }
+      if (pendingToolTasks.size > 0) {
+        await Promise.allSettled(pendingToolTasks);
+      }
+
+      const usage = runResult.meta?.agentMeta?.usage;
+      const promptTokens = runResult.meta?.agentMeta?.promptTokens;
+      const modelUsed = runResult.meta?.agentMeta?.model ?? fallbackModel ?? defaultModel;
+      const providerUsed =
+        runResult.meta?.agentMeta?.provider ?? fallbackProvider ?? followupRun.run.provider;
+      const verboseEnabled = resolvedVerboseLevel !== "off";
+      const selectedProvider = followupRun.run.provider;
+      const selectedModel = followupRun.run.model;
+      const fallbackStateEntry =
+        activeSessionEntry ?? (sessionKey ? activeSessionStore?.[sessionKey] : undefined);
+      const fallbackTransition = resolveFallbackTransition({
+        selectedProvider,
+        selectedModel,
+        activeProvider: providerUsed,
+        activeModel: modelUsed,
+        attempts: fallbackAttempts,
+        state: fallbackStateEntry,
       });
-      if (verboseEnabled) {
-        verboseNotices.push({
-          text: buildFallbackClearedNotice({
-            selectedProvider,
-            selectedModel,
-            previousActiveModel: fallbackTransition.previousState.activeModel,
-          }),
+      if (fallbackTransition.stateChanged) {
+        if (fallbackStateEntry) {
+          fallbackStateEntry.fallbackNoticeSelectedModel =
+            fallbackTransition.nextState.selectedModel;
+          fallbackStateEntry.fallbackNoticeActiveModel = fallbackTransition.nextState.activeModel;
+          fallbackStateEntry.fallbackNoticeReason = fallbackTransition.nextState.reason;
+          fallbackStateEntry.updatedAt = Date.now();
+          activeSessionEntry = fallbackStateEntry;
+        }
+        if (sessionKey && fallbackStateEntry && activeSessionStore) {
+          activeSessionStore[sessionKey] = fallbackStateEntry;
+        }
+        if (sessionKey && storePath) {
+          await updateSessionStoreEntry({
+            storePath,
+            sessionKey,
+            update: async () => ({
+              fallbackNoticeSelectedModel: fallbackTransition.nextState.selectedModel,
+              fallbackNoticeActiveModel: fallbackTransition.nextState.activeModel,
+              fallbackNoticeReason: fallbackTransition.nextState.reason,
+            }),
+          });
+        }
+      }
+      const cliSessionId = isCliProvider(providerUsed, cfg)
+        ? runResult.meta?.agentMeta?.sessionId?.trim()
+        : undefined;
+      const contextTokensUsed =
+        agentCfgContextTokens ??
+        lookupContextTokens(modelUsed) ??
+        activeSessionEntry?.contextTokens ??
+        DEFAULT_CONTEXT_TOKENS;
+
+      await persistRunSessionUsage({
+        storePath,
+        sessionKey,
+        usage,
+        lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
+        promptTokens,
+        modelUsed,
+        providerUsed,
+        contextTokensUsed,
+        systemPromptReport: runResult.meta?.systemPromptReport,
+        cliSessionId,
+      });
+
+      // Drain any late tool/block deliveries before deciding there's "nothing to send".
+      // Otherwise, a late typing trigger (e.g. from a tool callback) can outlive the run and
+      // keep the typing indicator stuck.
+      if (payloadArray.length === 0) {
+        return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
+      }
+
+      const payloadResult = await buildReplyPayloads({
+        payloads: payloadArray,
+        isHeartbeat,
+        didLogHeartbeatStrip,
+        blockStreamingEnabled,
+        blockReplyPipeline,
+        directlySentBlockKeys,
+        replyToMode,
+        replyToChannel,
+        currentMessageId: sessionCtx.MessageSidFull ?? sessionCtx.MessageSid,
+        messageProvider: followupRun.run.messageProvider,
+        messagingToolSentTexts: runResult.messagingToolSentTexts,
+        messagingToolSentMediaUrls: runResult.messagingToolSentMediaUrls,
+        messagingToolSentTargets: runResult.messagingToolSentTargets,
+        originatingChannel: sessionCtx.OriginatingChannel,
+        originatingTo: resolveOriginMessageTo({
+          originatingTo: sessionCtx.OriginatingTo,
+          to: sessionCtx.To,
+        }),
+        accountId: sessionCtx.AccountId,
+        normalizeMediaPaths: normalizeReplyMediaPaths,
+      });
+      const { replyPayloads } = payloadResult;
+      didLogHeartbeatStrip = payloadResult.didLogHeartbeatStrip;
+
+      if (replyPayloads.length === 0) {
+        return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
+      }
+
+      // Run after_agent_complete hook — allows plugins to reinject context
+      // or suppress the response before delivery.
+      const afterCompleteRunner = getGlobalHookRunner();
+      if (afterCompleteRunner?.hasHooks("after_agent_complete") && sessionKey) {
+        const responseText = replyPayloads
+          .map((p) => p.text ?? "")
+          .filter(Boolean)
+          .join("\n");
+        const channelId = (
+          replyToChannel ??
+          followupRun.run.messageProvider ??
+          "unknown"
+        ).toLowerCase();
+        const channelKey = [channelId, sessionCtx.AccountId, sessionCtx.To]
+          .filter(Boolean)
+          .join(":");
+        const agentId = followupRun.run.agentId;
+        const afterResult = await afterCompleteRunner.runAfterAgentComplete(
+          {
+            sessionKey,
+            channelId,
+            channelKey,
+            agentId,
+            response: responseText,
+            processingStartedAt: runStartedAt,
+            messageIdAtStart: sessionCtx.MessageSidFull ?? sessionCtx.MessageSid,
+            toolCallsMade: [] as PluginHookToolCallRecord[],
+          },
+          {
+            agentId,
+            sessionKey,
+            sessionId: followupRun.run.sessionId,
+            channelId,
+          },
+        );
+        if (afterResult?.suppress) {
+          return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
+        }
+        if (afterResult?.reinject && afterResult.injectContext) {
+          hookReinjectCount++;
+          if (hookReinjectCount <= HOOK_REINJECT_SAFETY_CAP) {
+            effectiveCommandBody = afterResult.injectContext;
+            defaultRuntime.error(
+              `[hook] after_agent_complete: reinject requested (attempt ${hookReinjectCount})`,
+            );
+            // Streaming pipeline was already flushed; disable for reinject runs.
+            blockReplyPipeline = null;
+            continue reinjectLoop;
+          }
+          defaultRuntime.error(
+            `[hook] after_agent_complete: reinject safety cap (${HOOK_REINJECT_SAFETY_CAP}) reached, delivering as-is`,
+          );
+        }
+      }
+
+      const successfulCronAdds = runResult.successfulCronAdds ?? 0;
+      const hasReminderCommitment = replyPayloads.some(
+        (payload) =>
+          !payload.isError &&
+          typeof payload.text === "string" &&
+          hasUnbackedReminderCommitment(payload.text),
+      );
+      // Suppress the guard note when an existing cron job (created in a prior
+      // turn) already covers the commitment — avoids false positives (#32228).
+      const coveredByExistingCron =
+        hasReminderCommitment && successfulCronAdds === 0
+          ? await hasSessionRelatedCronJobs({
+              cronStorePath: cfg.cron?.store,
+              sessionKey,
+            })
+          : false;
+      const guardedReplyPayloads =
+        hasReminderCommitment && successfulCronAdds === 0 && !coveredByExistingCron
+          ? appendUnscheduledReminderNote(replyPayloads)
+          : replyPayloads;
+
+      await signalTypingIfNeeded(guardedReplyPayloads, typingSignals);
+
+      if (isDiagnosticsEnabled(cfg) && hasNonzeroUsage(usage)) {
+        const input = usage.input ?? 0;
+        const output = usage.output ?? 0;
+        const cacheRead = usage.cacheRead ?? 0;
+        const cacheWrite = usage.cacheWrite ?? 0;
+        const promptTokens = input + cacheRead + cacheWrite;
+        const totalTokens = usage.total ?? promptTokens + output;
+        const costConfig = resolveModelCostConfig({
+          provider: providerUsed,
+          model: modelUsed,
+          config: cfg,
+        });
+        const costUsd = estimateUsageCost({ usage, cost: costConfig });
+        emitDiagnosticEvent({
+          type: "model.usage",
+          sessionKey,
+          sessionId: followupRun.run.sessionId,
+          channel: replyToChannel,
+          provider: providerUsed,
+          model: modelUsed,
+          usage: {
+            input,
+            output,
+            cacheRead,
+            cacheWrite,
+            promptTokens,
+            total: totalTokens,
+          },
+          lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
+          context: {
+            limit: contextTokensUsed,
+            used: totalTokens,
+          },
+          costUsd,
+          durationMs: Date.now() - runStartedAt,
         });
       }
-    }
 
-    if (autoCompactionCompleted) {
-      const count = await incrementRunCompactionCount({
-        sessionEntry: activeSessionEntry,
-        sessionStore: activeSessionStore,
-        sessionKey,
-        storePath,
-        lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
-        contextTokensUsed,
-      });
+      const responseUsageRaw =
+        activeSessionEntry?.responseUsage ??
+        (sessionKey ? activeSessionStore?.[sessionKey]?.responseUsage : undefined);
+      const responseUsageMode = resolveResponseUsageMode(responseUsageRaw);
+      if (responseUsageMode !== "off" && hasNonzeroUsage(usage)) {
+        const authMode = resolveModelAuthMode(providerUsed, cfg);
+        const showCost = authMode === "api-key";
+        const costConfig = showCost
+          ? resolveModelCostConfig({
+              provider: providerUsed,
+              model: modelUsed,
+              config: cfg,
+            })
+          : undefined;
+        let formatted = formatResponseUsageLine({
+          usage,
+          showCost,
+          costConfig,
+        });
+        if (formatted && responseUsageMode === "full" && sessionKey) {
+          formatted = `${formatted} · session \`${sessionKey}\``;
+        }
+        if (formatted) {
+          responseUsageLine = formatted;
+        }
+      }
 
-      // Inject post-compaction workspace context for the next agent turn
-      if (sessionKey) {
-        const workspaceDir = process.cwd();
-        readPostCompactionContext(workspaceDir, cfg)
-          .then((contextContent) => {
-            if (contextContent) {
-              enqueueSystemEvent(contextContent, { sessionKey });
-            }
-          })
-          .catch(() => {
-            // Silent failure — post-compaction context is best-effort
+      // If verbose is enabled, prepend operational run notices.
+      let finalPayloads = guardedReplyPayloads;
+      const verboseNotices: ReplyPayload[] = [];
+
+      if (verboseEnabled && activeIsNewSession) {
+        verboseNotices.push({ text: `🧭 New session: ${followupRun.run.sessionId}` });
+      }
+
+      if (fallbackTransition.fallbackTransitioned) {
+        emitAgentEvent({
+          runId,
+          sessionKey,
+          stream: "lifecycle",
+          data: {
+            phase: "fallback",
+            selectedProvider,
+            selectedModel,
+            activeProvider: providerUsed,
+            activeModel: modelUsed,
+            reasonSummary: fallbackTransition.reasonSummary,
+            attemptSummaries: fallbackTransition.attemptSummaries,
+            attempts: fallbackAttempts,
+          },
+        });
+        if (verboseEnabled) {
+          const fallbackNotice = buildFallbackNotice({
+            selectedProvider,
+            selectedModel,
+            activeProvider: providerUsed,
+            activeModel: modelUsed,
+            attempts: fallbackAttempts,
           });
+          if (fallbackNotice) {
+            verboseNotices.push({ text: fallbackNotice });
+          }
+        }
+      }
+      if (fallbackTransition.fallbackCleared) {
+        emitAgentEvent({
+          runId,
+          sessionKey,
+          stream: "lifecycle",
+          data: {
+            phase: "fallback_cleared",
+            selectedProvider,
+            selectedModel,
+            activeProvider: providerUsed,
+            activeModel: modelUsed,
+            previousActiveModel: fallbackTransition.previousState.activeModel,
+          },
+        });
+        if (verboseEnabled) {
+          verboseNotices.push({
+            text: buildFallbackClearedNotice({
+              selectedProvider,
+              selectedModel,
+              previousActiveModel: fallbackTransition.previousState.activeModel,
+            }),
+          });
+        }
       }
 
-      if (verboseEnabled) {
-        const suffix = typeof count === "number" ? ` (count ${count})` : "";
-        verboseNotices.push({ text: `🧹 Auto-compaction complete${suffix}.` });
-      }
-    }
-    if (verboseNotices.length > 0) {
-      finalPayloads = [...verboseNotices, ...finalPayloads];
-    }
-    if (responseUsageLine) {
-      finalPayloads = appendUsageLine(finalPayloads, responseUsageLine);
-    }
+      if (autoCompactionCompleted) {
+        const count = await incrementRunCompactionCount({
+          sessionEntry: activeSessionEntry,
+          sessionStore: activeSessionStore,
+          sessionKey,
+          storePath,
+          lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
+          contextTokensUsed,
+        });
 
-    return finalizeWithFollowup(
-      finalPayloads.length === 1 ? finalPayloads[0] : finalPayloads,
-      queueKey,
-      runFollowupTurn,
-    );
+        // Inject post-compaction workspace context for the next agent turn
+        if (sessionKey) {
+          const workspaceDir = process.cwd();
+          readPostCompactionContext(workspaceDir, cfg)
+            .then((contextContent) => {
+              if (contextContent) {
+                enqueueSystemEvent(contextContent, { sessionKey });
+              }
+            })
+            .catch(() => {
+              // Silent failure — post-compaction context is best-effort
+            });
+        }
+
+        if (verboseEnabled) {
+          const suffix = typeof count === "number" ? ` (count ${count})` : "";
+          verboseNotices.push({ text: `🧹 Auto-compaction complete${suffix}.` });
+        }
+      }
+      if (verboseNotices.length > 0) {
+        finalPayloads = [...verboseNotices, ...finalPayloads];
+      }
+      if (responseUsageLine) {
+        finalPayloads = appendUsageLine(finalPayloads, responseUsageLine);
+      }
+
+      return finalizeWithFollowup(
+        finalPayloads.length === 1 ? finalPayloads[0] : finalPayloads,
+        queueKey,
+        runFollowupTurn,
+      );
+    } // end reinjectLoop
   } catch (error) {
     // Keep the followup queue moving even when an unexpected exception escapes
     // the run path; the caller still receives the original error.
