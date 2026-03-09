@@ -50,8 +50,9 @@ export default function register(api: OpenClawPluginApi) {
   // before_agent_start: snapshot channel timestamp for this run
   // ---------------------------------------------------------------------------
   api.on("before_agent_start", async (_event, ctx) => {
-    if (!ctx.channelId || !ctx.agentId) return;
-    const channelKey = buildChannelKey(ctx.channelId);
+    if (!ctx.agentId || !ctx.sessionKey) return;
+    const channelKey = deriveChannelKeyFromSession(ctx.sessionKey);
+    if (!channelKey) return;
     coordinator.onAgentStart(ctx.agentId, channelKey);
   });
 
@@ -89,14 +90,15 @@ function buildChannelKey(channelId: string, accountId?: string, conversationId?:
 }
 
 /**
- * Derive a channel key from a session key. Best-effort heuristic.
- * Session keys follow: agent:<agentId>:<channel>:<...identifiers>
+ * Derive a channel key from a session key.
+ * Session keys follow: agent:<agentId>:<channel>:<accountId>:<conversationId>
+ * Core builds channelKey as: <channel>:<accountId>:<conversationId>
+ * So we take everything after the first two segments (agent + agentId).
  */
 function deriveChannelKeyFromSession(sessionKey: string): string | undefined {
   const parts = sessionKey.split(":");
   if (parts.length < 3) return undefined;
   const channelStart = parts[0] === "agent" ? 2 : 0;
   if (channelStart >= parts.length) return undefined;
-  const channelParts = parts.slice(channelStart, Math.min(channelStart + 3, parts.length));
-  return channelParts.join(":");
+  return parts.slice(channelStart).join(":");
 }
