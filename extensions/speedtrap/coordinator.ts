@@ -10,8 +10,8 @@
  *              its response while confirming what it did
  *
  * Keying strategy:
- *   - Channel state keyed by the full channelKey from message_received
- *     (e.g. "slack:default:channel:C0AJD0XBMUJ").
+ *   - Channel state keyed by the normalized physical channelKey
+ *     (e.g. "slack:channel:C0AJD0XBMUJ", with accountId stripped).
  *   - Agent runs keyed by agentId only. An agent has at most one active
  *     run, and this avoids channelKey format mismatches between hooks
  *     that have different context available.
@@ -19,14 +19,29 @@
  *     after_agent_complete event, which matches message_received's format.
  *   - Both message_received and onAgentStart use Date.now(), so the
  *     "channel moved" comparison is wall-clock based.
+ *
+ * State is module-level (shared singleton):
+ *   The plugin may be instantiated multiple times across subsystems
+ *   (e.g. "gateway" and "plugins"), each with its own coordinator.
+ *   Different hooks for the same agent run can fire through different
+ *   subsystems. Module-level Maps ensure all instances share state.
  */
 
 import { isWriteTool } from "./classifier.js";
 import type { AgentRunState, ChannelState, SpeedtrapDecision, SpeedtrapConfig } from "./types.js";
 
+// Shared across all coordinator instances so hooks firing from different
+// subsystems (gateway vs plugins) see the same state.
+const channels = new Map<string, ChannelState>();
+const agentRuns = new Map<string, AgentRunState>();
+
+/** Reset shared state. Exported for tests only. */
+export function resetSharedState(): void {
+  channels.clear();
+  agentRuns.clear();
+}
+
 export class SpeedtrapCoordinator {
-  private readonly channels = new Map<string, ChannelState>();
-  private readonly agentRuns = new Map<string, AgentRunState>();
   private readonly config: SpeedtrapConfig;
   private readonly log: (msg: string) => void;
 
@@ -40,10 +55,10 @@ export class SpeedtrapCoordinator {
   // ---------------------------------------------------------------------------
 
   onMessageReceived(channelKey: string, timestamp: number): void {
-    let channel = this.channels.get(channelKey);
+    let channel = channels.get(channelKey);
     if (!channel) {
       channel = { channelKey, lastMessageTimestamp: 0 };
-      this.channels.set(channelKey, channel);
+      channels.set(channelKey, channel);
     }
     channel.lastMessageTimestamp = timestamp;
     this.log(`Channel ${channelKey}: message received, timestamp updated`);
@@ -55,7 +70,7 @@ export class SpeedtrapCoordinator {
 
   onAgentStart(agentId: string): void {
     const startedAt = Date.now();
-    this.agentRuns.set(agentId, {
+    agentRuns.set(agentId, {
       agentId,
       startedAt,
       hasWriteSideEffects: false,
@@ -71,7 +86,7 @@ export class SpeedtrapCoordinator {
   // ---------------------------------------------------------------------------
 
   onToolCall(agentId: string, toolName: string): void {
-    const run = this.agentRuns.get(agentId);
+    const run = agentRuns.get(agentId);
     if (!run) return;
 
     const isWrite = isWriteTool(toolName, this.config.assumeUnknownToolsAreWrites);
@@ -89,8 +104,8 @@ export class SpeedtrapCoordinator {
   // ---------------------------------------------------------------------------
 
   getDecision(agentId: string, channelKey: string, draftResponse: string): SpeedtrapDecision {
-    const run = this.agentRuns.get(agentId);
-    const channel = this.channels.get(channelKey);
+    const run = agentRuns.get(agentId);
+    const channel = channels.get(channelKey);
 
     const preview = truncate(draftResponse, 200);
 
@@ -106,7 +121,7 @@ export class SpeedtrapCoordinator {
     const channelMoved = currentTimestamp > run.startedAt;
 
     if (!channelMoved) {
-      this.agentRuns.delete(agentId);
+      agentRuns.delete(agentId);
       this.log(
         `Agent ${agentId} completed on ${channelKey}: channel unchanged → delivering\n  response: ${preview}`,
       );
@@ -115,7 +130,7 @@ export class SpeedtrapCoordinator {
 
     if (run.hasWriteSideEffects) {
       if (run.reinjectCount >= this.config.maxReinjects) {
-        this.agentRuns.delete(agentId);
+        agentRuns.delete(agentId);
         this.log(
           `Agent ${agentId} on ${channelKey}: reinject budget exhausted (${run.reinjectCount}), delivering\n  response: ${preview}`,
         );
@@ -130,7 +145,7 @@ export class SpeedtrapCoordinator {
       return { action: "reinject", context };
     }
 
-    this.agentRuns.delete(agentId);
+    agentRuns.delete(agentId);
     this.log(
       `Agent ${agentId} completed on ${channelKey}: channel moved, no writes → discarding\n  response: ${preview}`,
     );

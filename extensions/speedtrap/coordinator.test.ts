@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { SpeedtrapCoordinator } from "./coordinator.js";
+import { beforeEach, describe, expect, it } from "vitest";
+import { SpeedtrapCoordinator, resetSharedState } from "./coordinator.js";
 import type { SpeedtrapConfig } from "./types.js";
 
 function createCoordinator(overrides: Partial<SpeedtrapConfig> = {}): {
@@ -21,6 +21,10 @@ function createCoordinator(overrides: Partial<SpeedtrapConfig> = {}): {
 const FUTURE = Date.now() + 60_000;
 
 describe("SpeedtrapCoordinator", () => {
+  beforeEach(() => {
+    resetSharedState();
+  });
+
   describe("channel unchanged → deliver", () => {
     it("delivers when no new messages arrived after agent start", () => {
       const { coordinator } = createCoordinator();
