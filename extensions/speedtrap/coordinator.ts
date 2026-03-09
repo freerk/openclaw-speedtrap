@@ -14,10 +14,10 @@ import { isWriteTool } from "./classifier.js";
 import type { AgentRunState, ChannelState, SpeedtrapDecision, SpeedtrapConfig } from "./types.js";
 
 export class SpeedtrapCoordinator {
-  private channels = new Map<string, ChannelState>();
-  private agentRuns = new Map<string, AgentRunState>();
-  private config: SpeedtrapConfig;
-  private log: (msg: string) => void;
+  private readonly channels = new Map<string, ChannelState>();
+  private readonly agentRuns = new Map<string, AgentRunState>();
+  private readonly config: SpeedtrapConfig;
+  private readonly log: (msg: string) => void;
 
   constructor(config: SpeedtrapConfig, log: (msg: string) => void) {
     this.config = config;
@@ -53,6 +53,7 @@ export class SpeedtrapCoordinator {
       startedAt: snapshotTimestamp,
       hasWriteSideEffects: false,
       writeToolNames: [],
+      reinjectCount: 0,
     });
 
     this.log(`Agent ${agentId} started on ${channelKey}, snapshot timestamp=${snapshotTimestamp}`);
@@ -95,22 +96,30 @@ export class SpeedtrapCoordinator {
     const currentTimestamp = channel?.lastMessageTimestamp ?? 0;
     const channelMoved = currentTimestamp > run.startedAt;
 
-    // Clean up the run state
-    this.agentRuns.delete(runKey);
-
     if (!channelMoved) {
+      this.agentRuns.delete(runKey);
       this.log(`Agent ${agentId} completed on ${channelKey}: channel unchanged → delivering`);
       return { action: "deliver" };
     }
 
     if (run.hasWriteSideEffects) {
+      if (run.reinjectCount >= this.config.maxReinjects) {
+        this.agentRuns.delete(runKey);
+        this.log(
+          `Agent ${agentId} on ${channelKey}: reinject budget exhausted (${run.reinjectCount}), delivering`,
+        );
+        return { action: "deliver" };
+      }
+      // Keep the run state — we'll see it again after core re-runs the agent
+      run.reinjectCount++;
       this.log(
-        `Agent ${agentId} completed on ${channelKey}: channel moved, has writes → reinjecting`,
+        `Agent ${agentId} on ${channelKey}: channel moved, has writes → reinjecting (${run.reinjectCount}/${this.config.maxReinjects})`,
       );
       const context = buildWriteReinjectionPrompt(draftResponse, run.writeToolNames);
       return { action: "reinject", context };
     }
 
+    this.agentRuns.delete(runKey);
     this.log(`Agent ${agentId} completed on ${channelKey}: channel moved, no writes → discarding`);
     return { action: "suppress" };
   }

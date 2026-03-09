@@ -10,6 +10,7 @@ function createCoordinator(overrides: Partial<SpeedtrapConfig> = {}): {
   const config: SpeedtrapConfig = {
     assumeUnknownToolsAreWrites: true,
     debug: true,
+    maxReinjects: 3,
     ...overrides,
   };
   const coordinator = new SpeedtrapCoordinator(config, (msg) => logs.push(msg));
@@ -232,7 +233,73 @@ describe("SpeedtrapCoordinator", () => {
       coordinator.onMessageReceived("ch:1", 2000);
       coordinator.getDecision("agent-a", "ch:1", "resp");
 
-      expect(logs.some((l) => l.includes("channel moved, has writes → reinjecting"))).toBe(true);
+      expect(logs.some((l) => l.includes("channel moved, has writes → reinjecting (1/3)"))).toBe(
+        true,
+      );
+    });
+  });
+
+  describe("reinject budget exhaustion", () => {
+    it("delivers after maxReinjects is reached", () => {
+      const { coordinator } = createCoordinator({ maxReinjects: 2 });
+
+      coordinator.onMessageReceived("ch:1", 1000);
+      coordinator.onAgentStart("agent-a", "ch:1");
+      coordinator.onToolCall("agent-a", "ch:1", "bash");
+      coordinator.onMessageReceived("ch:1", 2000);
+
+      // First two calls reinject
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-1").action).toBe("reinject");
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-2").action).toBe("reinject");
+
+      // Third call: budget exhausted, forced delivery
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-3").action).toBe("deliver");
+    });
+
+    it("cleans up run state after budget exhaustion", () => {
+      const { coordinator } = createCoordinator({ maxReinjects: 1 });
+
+      coordinator.onMessageReceived("ch:1", 1000);
+      coordinator.onAgentStart("agent-a", "ch:1");
+      coordinator.onToolCall("agent-a", "ch:1", "bash");
+      coordinator.onMessageReceived("ch:1", 2000);
+
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-1").action).toBe("reinject");
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-2").action).toBe("deliver");
+
+      // State cleaned up — falls back to conservative deliver
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-3").action).toBe("deliver");
+    });
+
+    it("preserves write tool tracking across reinjects", () => {
+      const { coordinator } = createCoordinator({ maxReinjects: 2 });
+
+      coordinator.onMessageReceived("ch:1", 1000);
+      coordinator.onAgentStart("agent-a", "ch:1");
+      coordinator.onToolCall("agent-a", "ch:1", "write_file");
+      coordinator.onMessageReceived("ch:1", 2000);
+
+      const decision = coordinator.getDecision("agent-a", "ch:1", "draft");
+      expect(decision.action).toBe("reinject");
+      if (decision.action === "reinject") {
+        expect(decision.context).toContain("write_file");
+      }
+    });
+  });
+
+  describe("run state cleanup on reinject vs deliver/suppress", () => {
+    it("keeps run state alive during reinject cycle", () => {
+      const { coordinator } = createCoordinator({ maxReinjects: 3 });
+
+      coordinator.onMessageReceived("ch:1", 1000);
+      coordinator.onAgentStart("agent-a", "ch:1");
+      coordinator.onToolCall("agent-a", "ch:1", "bash");
+      coordinator.onMessageReceived("ch:1", 2000);
+
+      // Reinject keeps state
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-1").action).toBe("reinject");
+      // State still there for next decision
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-2").action).toBe("reinject");
     });
   });
 });

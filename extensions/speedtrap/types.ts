@@ -14,11 +14,14 @@ export type SpeedtrapConfig = {
   assumeUnknownToolsAreWrites: boolean;
   /** Log all Speedtrap decisions to console. */
   debug: boolean;
+  /** Max reinject attempts before forcing delivery. Plugin-owned budget. */
+  maxReinjects: number;
 };
 
 export const DEFAULT_CONFIG: SpeedtrapConfig = {
   assumeUnknownToolsAreWrites: true,
   debug: true,
+  maxReinjects: 3,
 };
 
 /**
@@ -39,6 +42,8 @@ export type AgentRunState = {
   hasWriteSideEffects: boolean;
   /** Names of write tools invoked during this run (for reinjection context). */
   writeToolNames: string[];
+  /** How many times this run has been reinjected. */
+  reinjectCount: number;
 };
 
 /**

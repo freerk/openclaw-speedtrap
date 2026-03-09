@@ -27,6 +27,7 @@ export default function register(api: OpenClawPluginApi) {
     assumeUnknownToolsAreWrites:
       pluginCfg.assumeUnknownToolsAreWrites ?? DEFAULT_CONFIG.assumeUnknownToolsAreWrites,
     debug: pluginCfg.debug ?? DEFAULT_CONFIG.debug,
+    maxReinjects: pluginCfg.maxReinjects ?? DEFAULT_CONFIG.maxReinjects,
   };
 
   const log = (msg: string) => {
