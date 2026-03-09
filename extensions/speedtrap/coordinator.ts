@@ -92,9 +92,13 @@ export class SpeedtrapCoordinator {
     const run = this.agentRuns.get(agentId);
     const channel = this.channels.get(channelKey);
 
+    const preview = truncate(draftResponse, 200);
+
     // No tracked run — let it through (conservative)
     if (!run) {
-      this.log(`Agent ${agentId} completed on ${channelKey}: no tracked run → delivering`);
+      this.log(
+        `Agent ${agentId} completed on ${channelKey}: no tracked run → delivering\n  response: ${preview}`,
+      );
       return { action: "deliver" };
     }
 
@@ -103,7 +107,9 @@ export class SpeedtrapCoordinator {
 
     if (!channelMoved) {
       this.agentRuns.delete(agentId);
-      this.log(`Agent ${agentId} completed on ${channelKey}: channel unchanged → delivering`);
+      this.log(
+        `Agent ${agentId} completed on ${channelKey}: channel unchanged → delivering\n  response: ${preview}`,
+      );
       return { action: "deliver" };
     }
 
@@ -111,21 +117,23 @@ export class SpeedtrapCoordinator {
       if (run.reinjectCount >= this.config.maxReinjects) {
         this.agentRuns.delete(agentId);
         this.log(
-          `Agent ${agentId} on ${channelKey}: reinject budget exhausted (${run.reinjectCount}), delivering`,
+          `Agent ${agentId} on ${channelKey}: reinject budget exhausted (${run.reinjectCount}), delivering\n  response: ${preview}`,
         );
         return { action: "deliver" };
       }
       // Keep the run state — we'll see it again after core re-runs the agent
       run.reinjectCount++;
       this.log(
-        `Agent ${agentId} on ${channelKey}: channel moved, has writes → reinjecting (${run.reinjectCount}/${this.config.maxReinjects})`,
+        `Agent ${agentId} on ${channelKey}: channel moved, has writes → reinjecting (${run.reinjectCount}/${this.config.maxReinjects})\n  response: ${preview}`,
       );
       const context = buildWriteReinjectionPrompt(draftResponse, run.writeToolNames);
       return { action: "reinject", context };
     }
 
     this.agentRuns.delete(agentId);
-    this.log(`Agent ${agentId} completed on ${channelKey}: channel moved, no writes → discarding`);
+    this.log(
+      `Agent ${agentId} completed on ${channelKey}: channel moved, no writes → discarding\n  response: ${preview}`,
+    );
     return { action: "suppress" };
   }
 }
@@ -150,4 +158,10 @@ function buildWriteReinjectionPrompt(draftResponse: string, writeToolNames: stri
     "but adapt your message to the current conversation state.",
     "Do not mention this notice in your response.",
   ].join("\n");
+}
+
+function truncate(text: string, maxLen: number): string {
+  const oneLine = text.replaceAll("\n", " ").trim();
+  if (oneLine.length <= maxLen) return oneLine;
+  return `${oneLine.slice(0, maxLen)}...`;
 }
