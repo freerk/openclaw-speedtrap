@@ -2,9 +2,10 @@ import { describe, expect, it } from "vitest";
 import { SpeedtrapV2Coordinator } from "./coordinator.js";
 import type { SpeedtrapV2Config } from "./types.js";
 
-function createCoordinator(
-  overrides: Partial<SpeedtrapV2Config> = {},
-): { coordinator: SpeedtrapV2Coordinator; logs: string[] } {
+function createCoordinator(overrides: Partial<SpeedtrapV2Config> = {}): {
+  coordinator: SpeedtrapV2Coordinator;
+  logs: string[];
+} {
   const logs: string[] = [];
   const config: SpeedtrapV2Config = {
     assumeUnknownToolsAreWrites: true,

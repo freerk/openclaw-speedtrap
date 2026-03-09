@@ -72,7 +72,9 @@ export class SpeedtrapV2Coordinator {
       run.hasWriteSideEffects = true;
       run.writeToolNames.push(toolName);
     }
-    this.log(`Agent ${agentId} tool call: ${toolName} (classified as ${isWrite ? "write" : "read"})`);
+    this.log(
+      `Agent ${agentId} tool call: ${toolName} (classified as ${isWrite ? "write" : "read"})`,
+    );
   }
 
   // ---------------------------------------------------------------------------

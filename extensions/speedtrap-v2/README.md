@@ -14,11 +14,11 @@ With N agents on the same channel:
 
 All agents receive all messages and process them normally. When an agent finishes, before delivery, Speedtrap checks: have new messages appeared on the channel since this agent started processing?
 
-| Channel moved? | Write side effects? | Outcome |
-|---|---|---|
-| No | — | **deliver** — response is fresh |
-| Yes | No | **suppress** — response is stale, discard it |
-| Yes | Yes | **reinject** — re-run so agent can revise while confirming what it did |
+| Channel moved? | Write side effects? | Outcome                                                                |
+| -------------- | ------------------- | ---------------------------------------------------------------------- |
+| No             | —                   | **deliver** — response is fresh                                        |
+| Yes            | No                  | **suppress** — response is stale, discard it                           |
+| Yes            | Yes                 | **reinject** — re-run so agent can revise while confirming what it did |
 
 No buffering, no turn management, no special sentinel strings. The agent will get another chance naturally — new messages already triggered fresh runs through the normal pipeline.
 
@@ -60,10 +60,10 @@ Tools are classified as read or write using:
 }
 ```
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `assumeUnknownToolsAreWrites` | `true` | Unknown tools assumed to have write side effects (forces reinject instead of suppress) |
-| `debug` | `true` | Log all decisions to console |
+| Key                           | Default | Description                                                                            |
+| ----------------------------- | ------- | -------------------------------------------------------------------------------------- |
+| `assumeUnknownToolsAreWrites` | `true`  | Unknown tools assumed to have write side effects (forces reinject instead of suppress) |
+| `debug`                       | `true`  | Log all decisions to console                                                           |
 
 ## Architecture
 

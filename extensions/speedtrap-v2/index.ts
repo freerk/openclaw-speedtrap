@@ -83,11 +83,7 @@ export default function register(api: OpenClawPluginApi) {
 // Helpers (reused from v1)
 // ---------------------------------------------------------------------------
 
-function buildChannelKey(
-  channelId: string,
-  accountId?: string,
-  conversationId?: string,
-): string {
+function buildChannelKey(channelId: string, accountId?: string, conversationId?: string): string {
   return [channelId, accountId, conversationId].filter(Boolean).join(":");
 }
 

@@ -59,7 +59,11 @@ export function isWriteTool(toolName: string, assumeUnknownAreWrites: boolean): 
   }
 
   // Heuristic: tools with read/search/get/list/find/fetch prefixes are reads
-  if (/^(read|search|get|list|find|fetch|query|lookup|check|view|show|describe|inspect)_/.test(normalized)) {
+  if (
+    /^(read|search|get|list|find|fetch|query|lookup|check|view|show|describe|inspect)_/.test(
+      normalized,
+    )
+  ) {
     return false;
   }
 

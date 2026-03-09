@@ -1,6 +1,6 @@
 {
-  "id": "speedtrap-v2",
-  "name": "Speedtrap v2",
+  "id": "speedtrap",
+  "name": "Speedtrap",
   "description": "Discard stale agent responses when a channel moved during processing. No reinjection, no buffering — if the channel moved and the agent did no writes, the response is dropped.",
   "configSchema": {
     "type": "object",
