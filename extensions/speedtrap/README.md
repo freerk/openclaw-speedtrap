@@ -12,7 +12,7 @@ openclaw plugin install @openclaw/speedtrap
 
 ### Manual (monorepo)
 
-The plugin lives at `extensions/speedtrap-v2/`. If you're running from a git checkout, it's already available — just enable it in your config.
+The plugin lives at `extensions/speedtrap/`. If you're running from a git checkout, it's already available — just enable it in your config.
 
 ## Enable / Disable
 

@@ -9,7 +9,7 @@
     ],
     "install": {
       "npmSpec": "@openclaw/speedtrap",
-      "localPath": "extensions/speedtrap-v2",
+      "localPath": "extensions/speedtrap",
       "defaultChoice": "npm"
     }
   }
