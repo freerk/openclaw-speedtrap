@@ -37,4 +37,14 @@ export type AgentRunState = {
   channelKey: string;
   startedAt: number;
   hasWriteSideEffects: boolean;
+  /** Names of write tools invoked during this run (for reinjection context). */
+  writeToolNames: string[];
 };
+
+/**
+ * Decision returned by the coordinator after an agent completes.
+ */
+export type SpeedtrapDecision =
+  | { action: "deliver" }
+  | { action: "suppress" }
+  | { action: "reinject"; context: string };

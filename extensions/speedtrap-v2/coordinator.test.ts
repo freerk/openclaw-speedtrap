@@ -22,24 +22,22 @@ describe("SpeedtrapV2Coordinator", () => {
 
       coordinator.onMessageReceived("ch:1", 1000);
       coordinator.onAgentStart("agent-a", "ch:1");
-      // No new messages arrive
-      const suppress = coordinator.shouldSuppress("agent-a", "ch:1");
+      const decision = coordinator.getDecision("agent-a", "ch:1", "my response");
 
-      expect(suppress).toBe(false);
+      expect(decision.action).toBe("deliver");
     });
   });
 
-  describe("channel moved, no writes → discard", () => {
+  describe("channel moved, no writes → suppress", () => {
     it("suppresses when channel moved and agent had no write side effects", () => {
       const { coordinator } = createCoordinator();
 
       coordinator.onMessageReceived("ch:1", 1000);
       coordinator.onAgentStart("agent-a", "ch:1");
-      // New message arrives while agent is thinking
       coordinator.onMessageReceived("ch:1", 2000);
-      const suppress = coordinator.shouldSuppress("agent-a", "ch:1");
+      const decision = coordinator.getDecision("agent-a", "ch:1", "my response");
 
-      expect(suppress).toBe(true);
+      expect(decision.action).toBe("suppress");
     });
 
     it("suppresses when agent only used read-only tools", () => {
@@ -51,35 +49,58 @@ describe("SpeedtrapV2Coordinator", () => {
       coordinator.onToolCall("agent-a", "ch:1", "web_search");
       coordinator.onToolCall("agent-a", "ch:1", "file_read");
       coordinator.onMessageReceived("ch:1", 2000);
-      const suppress = coordinator.shouldSuppress("agent-a", "ch:1");
+      const decision = coordinator.getDecision("agent-a", "ch:1", "my response");
 
-      expect(suppress).toBe(true);
+      expect(decision.action).toBe("suppress");
     });
   });
 
-  describe("channel moved, has writes → deliver (forced)", () => {
-    it("delivers when agent had write side effects despite channel moving", () => {
+  describe("channel moved, has writes → reinject", () => {
+    it("reinjects when agent had write side effects and channel moved", () => {
       const { coordinator } = createCoordinator();
 
       coordinator.onMessageReceived("ch:1", 1000);
       coordinator.onAgentStart("agent-a", "ch:1");
       coordinator.onToolCall("agent-a", "ch:1", "write_file");
       coordinator.onMessageReceived("ch:1", 2000);
-      const suppress = coordinator.shouldSuppress("agent-a", "ch:1");
+      const decision = coordinator.getDecision("agent-a", "ch:1", "I wrote to config.json");
 
-      expect(suppress).toBe(false);
+      expect(decision.action).toBe("reinject");
+      if (decision.action === "reinject") {
+        expect(decision.context).toContain("write_file");
+        expect(decision.context).toContain("I wrote to config.json");
+        expect(decision.context).toContain("CHANNEL MOVED");
+      }
     });
 
-    it("delivers when unknown tool used with assumeUnknownToolsAreWrites=true", () => {
+    it("reinjects when unknown tool used with assumeUnknownToolsAreWrites=true", () => {
       const { coordinator } = createCoordinator({ assumeUnknownToolsAreWrites: true });
 
       coordinator.onMessageReceived("ch:1", 1000);
       coordinator.onAgentStart("agent-a", "ch:1");
       coordinator.onToolCall("agent-a", "ch:1", "some_custom_tool");
       coordinator.onMessageReceived("ch:1", 2000);
-      const suppress = coordinator.shouldSuppress("agent-a", "ch:1");
+      const decision = coordinator.getDecision("agent-a", "ch:1", "done");
 
-      expect(suppress).toBe(false);
+      expect(decision.action).toBe("reinject");
+    });
+
+    it("deduplicates tool names in reinjection context", () => {
+      const { coordinator } = createCoordinator();
+
+      coordinator.onMessageReceived("ch:1", 1000);
+      coordinator.onAgentStart("agent-a", "ch:1");
+      coordinator.onToolCall("agent-a", "ch:1", "write_file");
+      coordinator.onToolCall("agent-a", "ch:1", "write_file");
+      coordinator.onToolCall("agent-a", "ch:1", "bash");
+      coordinator.onMessageReceived("ch:1", 2000);
+      const decision = coordinator.getDecision("agent-a", "ch:1", "done");
+
+      expect(decision.action).toBe("reinject");
+      if (decision.action === "reinject") {
+        // write_file should appear once, not twice
+        expect(decision.context).toContain("write_file, bash");
+      }
     });
   });
 
@@ -91,9 +112,9 @@ describe("SpeedtrapV2Coordinator", () => {
       coordinator.onAgentStart("agent-a", "ch:1");
       coordinator.onToolCall("agent-a", "ch:1", "some_custom_tool");
       coordinator.onMessageReceived("ch:1", 2000);
-      const suppress = coordinator.shouldSuppress("agent-a", "ch:1");
+      const decision = coordinator.getDecision("agent-a", "ch:1", "done");
 
-      expect(suppress).toBe(true);
+      expect(decision.action).toBe("suppress");
     });
   });
 
@@ -108,19 +129,16 @@ describe("SpeedtrapV2Coordinator", () => {
       coordinator.onAgentStart("agent-c", "ch:1");
 
       // Agent A finishes first — channel hasn't moved
-      const suppressA = coordinator.shouldSuppress("agent-a", "ch:1");
-      expect(suppressA).toBe(false); // delivers
+      expect(coordinator.getDecision("agent-a", "ch:1", "resp-a").action).toBe("deliver");
 
       // Agent A's response appears as a new message on the channel
       coordinator.onMessageReceived("ch:1", 2000);
 
       // Agent B finishes — channel moved
-      const suppressB = coordinator.shouldSuppress("agent-b", "ch:1");
-      expect(suppressB).toBe(true); // discarded
+      expect(coordinator.getDecision("agent-b", "ch:1", "resp-b").action).toBe("suppress");
 
       // Agent C finishes — channel still moved
-      const suppressC = coordinator.shouldSuppress("agent-c", "ch:1");
-      expect(suppressC).toBe(true); // discarded
+      expect(coordinator.getDecision("agent-c", "ch:1", "resp-c").action).toBe("suppress");
     });
   });
 
@@ -133,19 +151,17 @@ describe("SpeedtrapV2Coordinator", () => {
       coordinator.onAgentStart("agent-a", "ch:1");
 
       // Agent A finishes + delivers
-      const suppressA = coordinator.shouldSuppress("agent-a", "ch:1");
-      expect(suppressA).toBe(false);
+      expect(coordinator.getDecision("agent-a", "ch:1", "resp").action).toBe("deliver");
 
       // Agent A's response triggers agent B (cascade)
       coordinator.onMessageReceived("ch:1", 2000);
       coordinator.onAgentStart("agent-b", "ch:1");
 
-      // Agent B's response appears
+      // Another message appears
       coordinator.onMessageReceived("ch:1", 3000);
 
-      // Meanwhile agent B finishes — channel moved
-      const suppressB = coordinator.shouldSuppress("agent-b", "ch:1");
-      expect(suppressB).toBe(true); // cascade extinguished
+      // Agent B finishes — channel moved
+      expect(coordinator.getDecision("agent-b", "ch:1", "resp").action).toBe("suppress");
     });
   });
 
@@ -153,8 +169,8 @@ describe("SpeedtrapV2Coordinator", () => {
     it("delivers when no run state exists for the agent", () => {
       const { coordinator } = createCoordinator();
 
-      const suppress = coordinator.shouldSuppress("unknown-agent", "ch:1");
-      expect(suppress).toBe(false);
+      const decision = coordinator.getDecision("unknown-agent", "ch:1", "resp");
+      expect(decision.action).toBe("deliver");
     });
   });
 
@@ -170,44 +186,52 @@ describe("SpeedtrapV2Coordinator", () => {
       // Only ch:1 moves
       coordinator.onMessageReceived("ch:1", 2000);
 
-      const suppressA = coordinator.shouldSuppress("agent-a", "ch:1");
-      const suppressB = coordinator.shouldSuppress("agent-b", "ch:2");
-
-      expect(suppressA).toBe(true); // ch:1 moved
-      expect(suppressB).toBe(false); // ch:2 unchanged
+      expect(coordinator.getDecision("agent-a", "ch:1", "resp").action).toBe("suppress");
+      expect(coordinator.getDecision("agent-b", "ch:2", "resp").action).toBe("deliver");
     });
   });
 
   describe("run state cleanup", () => {
-    it("cleans up run state after shouldSuppress", () => {
+    it("cleans up run state after getDecision", () => {
       const { coordinator } = createCoordinator();
 
       coordinator.onMessageReceived("ch:1", 1000);
       coordinator.onAgentStart("agent-a", "ch:1");
 
       // First call cleans up
-      coordinator.shouldSuppress("agent-a", "ch:1");
+      coordinator.getDecision("agent-a", "ch:1", "resp");
 
       // Second call has no state → conservative deliver
-      const suppress = coordinator.shouldSuppress("agent-a", "ch:1");
-      expect(suppress).toBe(false);
+      expect(coordinator.getDecision("agent-a", "ch:1", "resp").action).toBe("deliver");
     });
   });
 
   describe("debug logging", () => {
-    it("logs all decisions when debug is true", () => {
-      const { coordinator, logs } = createCoordinator({ debug: true });
+    it("logs suppress decisions", () => {
+      const { coordinator, logs } = createCoordinator();
 
       coordinator.onMessageReceived("ch:1", 1000);
       coordinator.onAgentStart("agent-a", "ch:1");
       coordinator.onToolCall("agent-a", "ch:1", "memory_search");
       coordinator.onMessageReceived("ch:1", 2000);
-      coordinator.shouldSuppress("agent-a", "ch:1");
+      coordinator.getDecision("agent-a", "ch:1", "resp");
 
       expect(logs).toContain("Channel ch:1: message received, timestamp updated");
       expect(logs).toContain("Agent agent-a started on ch:1, snapshot timestamp=1000");
       expect(logs).toContain("Agent agent-a tool call: memory_search (classified as read)");
       expect(logs.some((l) => l.includes("channel moved, no writes → discarding"))).toBe(true);
+    });
+
+    it("logs reinject decisions", () => {
+      const { coordinator, logs } = createCoordinator();
+
+      coordinator.onMessageReceived("ch:1", 1000);
+      coordinator.onAgentStart("agent-a", "ch:1");
+      coordinator.onToolCall("agent-a", "ch:1", "bash");
+      coordinator.onMessageReceived("ch:1", 2000);
+      coordinator.getDecision("agent-a", "ch:1", "resp");
+
+      expect(logs.some((l) => l.includes("channel moved, has writes → reinjecting"))).toBe(true);
     });
   });
 });

@@ -2,17 +2,19 @@
  * Speedtrap v2 Plugin — Discard Stale Responses
  *
  * If the channel moved while an agent was thinking, its response is stale —
- * drop it. No reinjection. No interruption prompts. No re-runs.
+ * drop it. If the agent executed write operations, reinject so it can revise
+ * its response while confirming what was done.
  *
- * The one exception: if the agent executed write operations (file writes,
- * config changes, API calls), deliver anyway — a slightly outdated response
- * that confirms what was done is better than a silent side effect.
+ * Three outcomes:
+ *   deliver  — channel unchanged → send response as-is
+ *   suppress — channel moved + no writes → discard silently
+ *   reinject — channel moved + writes → re-run with context
  *
  * Hooks used:
  *   message_received     — Update channel timestamp
  *   before_agent_start   — Snapshot channel timestamp at run start
  *   before_tool_call     — Classify tool as read/write, track writes
- *   after_agent_complete  — Compare timestamps → suppress if stale + no writes
+ *   after_agent_complete  — Compare timestamps → deliver / suppress / reinject
  */
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/speedtrap";
@@ -63,14 +65,17 @@ export default function register(api: OpenClawPluginApi) {
   });
 
   // ---------------------------------------------------------------------------
-  // after_agent_complete: discard stale responses, deliver fresh ones
+  // after_agent_complete: deliver / suppress / reinject
   // ---------------------------------------------------------------------------
   api.on("after_agent_complete", async (event, _ctx) => {
-    const suppress = coordinator.shouldSuppress(event.agentId, event.channelKey);
-    if (suppress) {
+    const decision = coordinator.getDecision(event.agentId, event.channelKey, event.response);
+    if (decision.action === "suppress") {
       return { suppress: true };
     }
-    // No return = deliver normally
+    if (decision.action === "reinject") {
+      return { reinject: true, injectContext: decision.context };
+    }
+    // "deliver" → no return = deliver normally
   });
 }
 

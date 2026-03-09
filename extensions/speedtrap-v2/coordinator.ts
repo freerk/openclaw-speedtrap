@@ -2,13 +2,16 @@
  * Speedtrap v2 Coordinator
  *
  * Minimal state manager: tracks per-channel message timestamps and
- * per-agent-run metadata. The only decision is discard vs deliver.
+ * per-agent-run metadata. Three possible outcomes:
  *
- * No buffering. No reinjection. No turn management.
+ *   deliver  — channel unchanged, response is fresh
+ *   suppress — channel moved, no writes, response is stale → discard
+ *   reinject — channel moved, has writes → re-run so agent can revise
+ *              its response while confirming what it did
  */
 
 import { isWriteTool } from "./classifier.js";
-import type { AgentRunState, ChannelState, SpeedtrapV2Config } from "./types.js";
+import type { AgentRunState, ChannelState, SpeedtrapDecision, SpeedtrapV2Config } from "./types.js";
 
 export class SpeedtrapV2Coordinator {
   private channels = new Map<string, ChannelState>();
@@ -49,6 +52,7 @@ export class SpeedtrapV2Coordinator {
       channelKey,
       startedAt: snapshotTimestamp,
       hasWriteSideEffects: false,
+      writeToolNames: [],
     });
 
     this.log(`Agent ${agentId} started on ${channelKey}, snapshot timestamp=${snapshotTimestamp}`);
@@ -66,15 +70,16 @@ export class SpeedtrapV2Coordinator {
     const isWrite = isWriteTool(toolName, this.config.assumeUnknownToolsAreWrites);
     if (isWrite) {
       run.hasWriteSideEffects = true;
+      run.writeToolNames.push(toolName);
     }
     this.log(`Agent ${agentId} tool call: ${toolName} (classified as ${isWrite ? "write" : "read"})`);
   }
 
   // ---------------------------------------------------------------------------
-  // after_agent_complete: discard or deliver
+  // after_agent_complete: deliver / suppress / reinject
   // ---------------------------------------------------------------------------
 
-  shouldSuppress(agentId: string, channelKey: string): boolean {
+  getDecision(agentId: string, channelKey: string, draftResponse: string): SpeedtrapDecision {
     const runKey = this.runKey(agentId, channelKey);
     const run = this.agentRuns.get(runKey);
     const channel = this.channels.get(channelKey);
@@ -82,7 +87,7 @@ export class SpeedtrapV2Coordinator {
     // No tracked run — let it through (conservative)
     if (!run) {
       this.log(`Agent ${agentId} completed on ${channelKey}: no tracked run → delivering`);
-      return false;
+      return { action: "deliver" };
     }
 
     const currentTimestamp = channel?.lastMessageTimestamp ?? 0;
@@ -93,18 +98,19 @@ export class SpeedtrapV2Coordinator {
 
     if (!channelMoved) {
       this.log(`Agent ${agentId} completed on ${channelKey}: channel unchanged → delivering`);
-      return false;
+      return { action: "deliver" };
     }
 
     if (run.hasWriteSideEffects) {
       this.log(
-        `Agent ${agentId} completed on ${channelKey}: channel moved, has writes → delivering (forced)`,
+        `Agent ${agentId} completed on ${channelKey}: channel moved, has writes → reinjecting`,
       );
-      return false;
+      const context = buildWriteReinjectionPrompt(draftResponse, run.writeToolNames);
+      return { action: "reinject", context };
     }
 
     this.log(`Agent ${agentId} completed on ${channelKey}: channel moved, no writes → discarding`);
-    return true;
+    return { action: "suppress" };
   }
 
   // ---------------------------------------------------------------------------
@@ -114,4 +120,26 @@ export class SpeedtrapV2Coordinator {
   private runKey(agentId: string, channelKey: string): string {
     return `${agentId}::${channelKey}`;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Reinjection prompt for write-side-effect runs
+// ---------------------------------------------------------------------------
+
+function buildWriteReinjectionPrompt(draftResponse: string, writeToolNames: string[]): string {
+  const toolList = [...new Set(writeToolNames)].join(", ");
+  return [
+    "[SPEEDTRAP: CHANNEL MOVED DURING YOUR RUN]",
+    "",
+    "New messages appeared on the channel while you were working.",
+    `You executed write operations (${toolList}) — those side effects already happened.`,
+    "",
+    "Your drafted response:",
+    draftResponse,
+    "",
+    "Revise your response to account for the new channel activity.",
+    "You must still confirm what you did (the writes already happened),",
+    "but adapt your message to the current conversation state.",
+    "Do not mention this notice in your response.",
+  ].join("\n");
 }
