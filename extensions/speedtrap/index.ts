@@ -22,6 +22,7 @@ import { SpeedtrapCoordinator } from "./coordinator.js";
 import { DEFAULT_CONFIG, type SpeedtrapConfig } from "./types.js";
 
 export default function register(api: OpenClawPluginApi) {
+  api.logger.info(`[SPEEDTRAP] register() called, plugin id=${api.id}`);
   const pluginCfg = (api.pluginConfig ?? {}) as Partial<SpeedtrapConfig>;
   const config: SpeedtrapConfig = {
     assumeUnknownToolsAreWrites:
