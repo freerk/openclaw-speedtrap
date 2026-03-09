@@ -37,7 +37,7 @@ export type ChannelState = {
  */
 export type AgentRunState = {
   agentId: string;
-  channelKey: string;
+  /** Wall-clock time (Date.now()) when the agent started processing. */
   startedAt: number;
   hasWriteSideEffects: boolean;
   /** Names of write tools invoked during this run (for reinjection context). */

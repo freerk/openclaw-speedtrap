@@ -47,23 +47,19 @@ export default function register(api: OpenClawPluginApi) {
   });
 
   // ---------------------------------------------------------------------------
-  // before_agent_start: snapshot channel timestamp for this run
+  // before_agent_start: record run start time (no channel key needed)
   // ---------------------------------------------------------------------------
   api.on("before_agent_start", async (_event, ctx) => {
-    if (!ctx.agentId || !ctx.sessionKey) return;
-    const channelKey = deriveChannelKeyFromSession(ctx.sessionKey);
-    if (!channelKey) return;
-    coordinator.onAgentStart(ctx.agentId, channelKey);
+    if (!ctx.agentId) return;
+    coordinator.onAgentStart(ctx.agentId);
   });
 
   // ---------------------------------------------------------------------------
   // before_tool_call: classify tool and track write side effects
   // ---------------------------------------------------------------------------
   api.on("before_tool_call", async (event, ctx) => {
-    if (!ctx.agentId || !ctx.sessionKey) return;
-    const channelKey = deriveChannelKeyFromSession(ctx.sessionKey);
-    if (!channelKey) return;
-    coordinator.onToolCall(ctx.agentId, channelKey, event.toolName);
+    if (!ctx.agentId) return;
+    coordinator.onToolCall(ctx.agentId, event.toolName);
   });
 
   // ---------------------------------------------------------------------------
@@ -87,18 +83,4 @@ export default function register(api: OpenClawPluginApi) {
 
 function buildChannelKey(channelId: string, accountId?: string, conversationId?: string): string {
   return [channelId, accountId, conversationId].filter(Boolean).join(":");
-}
-
-/**
- * Derive a channel key from a session key.
- * Session keys follow: agent:<agentId>:<channel>:<accountId>:<conversationId>
- * Core builds channelKey as: <channel>:<accountId>:<conversationId>
- * So we take everything after the first two segments (agent + agentId).
- */
-function deriveChannelKeyFromSession(sessionKey: string): string | undefined {
-  const parts = sessionKey.split(":");
-  if (parts.length < 3) return undefined;
-  const channelStart = parts[0] === "agent" ? 2 : 0;
-  if (channelStart >= parts.length) return undefined;
-  return parts.slice(channelStart).join(":");
 }

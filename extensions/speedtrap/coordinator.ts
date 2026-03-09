@@ -8,6 +8,17 @@
  *   suppress — channel moved, no writes, response is stale → discard
  *   reinject — channel moved, has writes → re-run so agent can revise
  *              its response while confirming what it did
+ *
+ * Keying strategy:
+ *   - Channel state keyed by the full channelKey from message_received
+ *     (e.g. "slack:default:channel:C0AJD0XBMUJ").
+ *   - Agent runs keyed by agentId only. An agent has at most one active
+ *     run, and this avoids channelKey format mismatches between hooks
+ *     that have different context available.
+ *   - getDecision receives the authoritative channelKey from core's
+ *     after_agent_complete event, which matches message_received's format.
+ *   - Both message_received and onAgentStart use Date.now(), so the
+ *     "channel moved" comparison is wall-clock based.
  */
 
 import { isWriteTool } from "./classifier.js";
@@ -39,33 +50,28 @@ export class SpeedtrapCoordinator {
   }
 
   // ---------------------------------------------------------------------------
-  // before_agent_start: snapshot channel timestamp
+  // before_agent_start: record run start time
   // ---------------------------------------------------------------------------
 
-  onAgentStart(agentId: string, channelKey: string): void {
-    const channel = this.channels.get(channelKey);
-    const snapshotTimestamp = channel?.lastMessageTimestamp ?? 0;
-
-    const runKey = this.runKey(agentId, channelKey);
-    this.agentRuns.set(runKey, {
+  onAgentStart(agentId: string): void {
+    const startedAt = Date.now();
+    this.agentRuns.set(agentId, {
       agentId,
-      channelKey,
-      startedAt: snapshotTimestamp,
+      startedAt,
       hasWriteSideEffects: false,
       writeToolNames: [],
       reinjectCount: 0,
     });
 
-    this.log(`Agent ${agentId} started on ${channelKey}, snapshot timestamp=${snapshotTimestamp}`);
+    this.log(`Agent ${agentId} started, timestamp=${startedAt}`);
   }
 
   // ---------------------------------------------------------------------------
   // before_tool_call: classify and track writes
   // ---------------------------------------------------------------------------
 
-  onToolCall(agentId: string, channelKey: string, toolName: string): void {
-    const runKey = this.runKey(agentId, channelKey);
-    const run = this.agentRuns.get(runKey);
+  onToolCall(agentId: string, toolName: string): void {
+    const run = this.agentRuns.get(agentId);
     if (!run) return;
 
     const isWrite = isWriteTool(toolName, this.config.assumeUnknownToolsAreWrites);
@@ -83,8 +89,7 @@ export class SpeedtrapCoordinator {
   // ---------------------------------------------------------------------------
 
   getDecision(agentId: string, channelKey: string, draftResponse: string): SpeedtrapDecision {
-    const runKey = this.runKey(agentId, channelKey);
-    const run = this.agentRuns.get(runKey);
+    const run = this.agentRuns.get(agentId);
     const channel = this.channels.get(channelKey);
 
     // No tracked run — let it through (conservative)
@@ -97,14 +102,14 @@ export class SpeedtrapCoordinator {
     const channelMoved = currentTimestamp > run.startedAt;
 
     if (!channelMoved) {
-      this.agentRuns.delete(runKey);
+      this.agentRuns.delete(agentId);
       this.log(`Agent ${agentId} completed on ${channelKey}: channel unchanged → delivering`);
       return { action: "deliver" };
     }
 
     if (run.hasWriteSideEffects) {
       if (run.reinjectCount >= this.config.maxReinjects) {
-        this.agentRuns.delete(runKey);
+        this.agentRuns.delete(agentId);
         this.log(
           `Agent ${agentId} on ${channelKey}: reinject budget exhausted (${run.reinjectCount}), delivering`,
         );
@@ -119,17 +124,9 @@ export class SpeedtrapCoordinator {
       return { action: "reinject", context };
     }
 
-    this.agentRuns.delete(runKey);
+    this.agentRuns.delete(agentId);
     this.log(`Agent ${agentId} completed on ${channelKey}: channel moved, no writes → discarding`);
     return { action: "suppress" };
-  }
-
-  // ---------------------------------------------------------------------------
-  // Internal
-  // ---------------------------------------------------------------------------
-
-  private runKey(agentId: string, channelKey: string): string {
-    return `${agentId}::${channelKey}`;
   }
 }
 
