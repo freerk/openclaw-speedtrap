@@ -406,6 +406,8 @@ export type PluginHookAgentContext = {
   trigger?: string;
   /** Channel identifier (e.g. "telegram", "discord", "whatsapp"). */
   channelId?: string;
+  /** Conversation target (e.g. "telegram:group:123:topic:456"). */
+  conversationId?: string;
 };
 
 // before_model_resolve hook
@@ -467,7 +469,10 @@ export type PluginHookBeforeAgentStartEvent = {
 };
 
 export type PluginHookBeforeAgentStartResult = PluginHookBeforePromptBuildResult &
-  PluginHookBeforeModelResolveResult;
+  PluginHookBeforeModelResolveResult & {
+    /** When true, the agent run is suppressed entirely (e.g. Speedtrap absorb). */
+    suppress?: boolean;
+  };
 
 export type PluginHookBeforeAgentStartOverrideResult = Omit<
   PluginHookBeforeAgentStartResult,

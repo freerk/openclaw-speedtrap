@@ -1,7 +1,12 @@
 /**
- * Speedtrap hook bindings.
+ * Speedtrap hook bindings — Absorb + Reinject
  *
- * Wires the four lifecycle hooks to the shared coordinator.
+ * Wires four lifecycle hooks to the shared coordinator:
+ *   message_received    → buffer if scope is processing
+ *   before_agent_start  → suppress if scope is already processing
+ *   before_tool_call    → classify and track writes
+ *   after_agent_complete → reinject if buffered messages exist
+ *
  * Separated from index.ts so the plugin entry point stays minimal.
  */
 
@@ -27,29 +32,38 @@ export function registerSpeedtrapHooks(api: OpenClawPluginApi): void {
 
   const coordinator = new SpeedtrapCoordinator(config, log);
 
-  api.on("message_received", async (_event, ctx) => {
+  // Buffer incoming messages if an agent is already processing for this scope
+  api.on("message_received", async (event, ctx) => {
     const channelKey = buildPhysicalChannelKey(ctx.channelId, ctx.conversationId);
-    coordinator.onMessageReceived(channelKey, Date.now());
+    coordinator.onMessageReceived(channelKey, event.content, event.timestamp ?? Date.now());
   });
 
+  // Suppress agent runs when another is already processing for this scope
   api.on("before_agent_start", async (_event, ctx) => {
-    if (!ctx.agentId) return;
-    coordinator.onAgentStart(ctx.agentId);
+    if (!ctx.agentId || !ctx.channelId) return;
+    const channelKey = buildPhysicalChannelKey(ctx.channelId, ctx.conversationId);
+    const shouldSuppress = coordinator.shouldSuppressAgentStart(ctx.agentId, channelKey);
+    if (shouldSuppress) {
+      return { suppress: true };
+    }
   });
 
+  // Track write side effects
   api.on("before_tool_call", async (event, ctx) => {
     if (!ctx.agentId) return;
-    coordinator.onToolCall(ctx.agentId, event.toolName);
+    const channelKey = ctx.channelId
+      ? buildPhysicalChannelKey(ctx.channelId, ctx.conversationId)
+      : undefined;
+    coordinator.onToolCall(ctx.agentId, channelKey, event.toolName);
   });
 
+  // Reinject if buffered messages exist, otherwise deliver
   api.on("after_agent_complete", async (event, _ctx) => {
     const channelKey = stripAccountFromChannelKey(event.channelKey, event.channelId);
     const decision = coordinator.getDecision(event.agentId, channelKey, event.response);
-    if (decision.action === "suppress") {
-      return { suppress: true };
-    }
     if (decision.action === "reinject") {
       return { reinject: true, injectContext: decision.context };
     }
+    // "deliver" → return nothing (let core deliver normally)
   });
 }

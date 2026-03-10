@@ -52,6 +52,8 @@ export type EmbeddedPiRunMeta = {
     name: string;
     arguments: string;
   }>;
+  /** True when a before_agent_start hook suppressed the run (Speedtrap absorb). */
+  suppressed?: boolean;
 };
 
 export type EmbeddedPiRunResult = {

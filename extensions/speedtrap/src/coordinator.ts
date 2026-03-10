@@ -1,44 +1,38 @@
 /**
- * Speedtrap Coordinator
+ * Speedtrap Coordinator — Absorb + Reinject
  *
- * Minimal state manager: tracks per-channel message timestamps and
- * per-agent-run metadata. Three possible outcomes:
+ * Instead of discarding stale responses, prevents duplicate agent triggers
+ * and reinjects buffered messages into the already-running agent.
  *
- *   deliver  — channel unchanged, response is fresh
- *   suppress — channel moved, no writes, response is stale → discard
- *   reinject — channel moved, has writes → re-run so agent can revise
- *              its response while confirming what it did
+ * Flow:
+ *   1. Message A → agent starts → scope marked as "processing"
+ *   2. Message B arrives while processing → buffered
+ *   3. Message B's agent trigger → before_agent_start returns suppress
+ *   4. Agent finishes A → after_agent_complete sees buffered messages → reinject
+ *   5. Agent re-runs with context → no new messages → deliver
  *
- * Keying strategy:
- *   - Channel state keyed by the normalized physical channelKey
- *     (e.g. "slack:channel:C0AJD0XBMUJ", with accountId stripped).
- *   - Agent runs keyed by agentId only. An agent has at most one active
- *     run, and this avoids channelKey format mismatches between hooks
- *     that have different context available.
- *   - getDecision receives the authoritative channelKey from core's
- *     after_agent_complete event, which matches message_received's format.
- *   - Both message_received and onAgentStart use Date.now(), so the
- *     "channel moved" comparison is wall-clock based.
+ * Scoping:
+ *   Keyed by "{agentId}:{physicalChannelKey}" so multi-channel agents
+ *   don't interfere across channels.
  *
- * State is module-level (shared singleton):
- *   The plugin may be instantiated multiple times across subsystems
- *   (e.g. "gateway" and "plugins"), each with its own coordinator.
- *   Different hooks for the same agent run can fire through different
- *   subsystems. Module-level Maps ensure all instances share state.
+ * State is module-level (shared singleton) so hooks firing from different
+ * subsystems (gateway vs plugins) see the same state.
  */
 
 import { isWriteTool } from "./classifier.js";
-import type { AgentRunState, ChannelState, SpeedtrapDecision, SpeedtrapConfig } from "./types.js";
+import type { SpeedtrapConfig, ScopeState, SpeedtrapDecision } from "./types.js";
 
-// Shared across all coordinator instances so hooks firing from different
-// subsystems (gateway vs plugins) see the same state.
-const channels = new Map<string, ChannelState>();
-const agentRuns = new Map<string, AgentRunState>();
+// Shared across all coordinator instances
+const scopes = new Map<string, ScopeState>();
 
 /** Reset shared state. Exported for tests only. */
 export function resetSharedState(): void {
-  channels.clear();
-  agentRuns.clear();
+  scopes.clear();
+}
+
+/** Build a scope key from agentId + channelKey. */
+export function buildScopeKey(agentId: string, channelKey: string): string {
+  return `${agentId}:${channelKey}`;
 }
 
 export class SpeedtrapCoordinator {
@@ -51,128 +45,190 @@ export class SpeedtrapCoordinator {
   }
 
   // ---------------------------------------------------------------------------
-  // message_received: update channel timestamp
+  // message_received: buffer if scope is processing, otherwise just record
   // ---------------------------------------------------------------------------
 
-  onMessageReceived(channelKey: string, timestamp: number): void {
-    let channel = channels.get(channelKey);
-    if (!channel) {
-      channel = { channelKey, lastMessageTimestamp: 0 };
-      channels.set(channelKey, channel);
+  onMessageReceived(channelKey: string, content: string, timestamp: number): void {
+    // Check all scopes for this channelKey — buffer if any agent is processing
+    for (const [, scope] of scopes) {
+      if (scope.channelKey === channelKey && scope.processing) {
+        scope.bufferedMessages.push({ content, timestamp });
+        this.log(
+          `Scope ${scope.scopeKey}: buffered message (${scope.bufferedMessages.length} total)`,
+        );
+        return;
+      }
     }
-    channel.lastMessageTimestamp = timestamp;
-    this.log(`Channel ${channelKey}: message received, timestamp updated`);
+    this.log(`Channel ${channelKey}: message received, no active scope to buffer`);
   }
 
   // ---------------------------------------------------------------------------
-  // before_agent_start: record run start time
+  // before_agent_start: suppress if scope is already processing
   // ---------------------------------------------------------------------------
 
-  onAgentStart(agentId: string): void {
-    const startedAt = Date.now();
-    agentRuns.set(agentId, {
-      agentId,
-      startedAt,
-      hasWriteSideEffects: false,
-      writeToolNames: [],
-      reinjectCount: 0,
-    });
+  shouldSuppressAgentStart(agentId: string, channelKey: string): boolean {
+    const scopeKey = buildScopeKey(agentId, channelKey);
+    const existing = scopes.get(scopeKey);
 
-    this.log(`Agent ${agentId} started, timestamp=${startedAt}`);
+    if (existing?.processing) {
+      this.log(`Scope ${scopeKey}: agent already processing → suppress new run`);
+      return true;
+    }
+
+    // Mark scope as processing
+    const scope: ScopeState = existing ?? {
+      scopeKey,
+      agentId,
+      channelKey,
+      processing: false,
+      bufferedMessages: [],
+      writeToolNames: [],
+      hasWriteSideEffects: false,
+      reinjectCount: 0,
+    };
+    scope.processing = true;
+    scope.writeToolNames = [];
+    scope.hasWriteSideEffects = false;
+    scopes.set(scopeKey, scope);
+
+    this.log(`Scope ${scopeKey}: agent start, marked as processing`);
+    return false;
   }
 
   // ---------------------------------------------------------------------------
   // before_tool_call: classify and track writes
   // ---------------------------------------------------------------------------
 
-  onToolCall(agentId: string, toolName: string): void {
-    const run = agentRuns.get(agentId);
-    if (!run) return;
+  onToolCall(agentId: string, channelKey: string | undefined, toolName: string): void {
+    // Try to find the scope — we may only have agentId
+    let scope: ScopeState | undefined;
+    if (channelKey) {
+      scope = scopes.get(buildScopeKey(agentId, channelKey));
+    }
+    // Fallback: find any active scope for this agentId
+    if (!scope) {
+      for (const [, s] of scopes) {
+        if (s.agentId === agentId && s.processing) {
+          scope = s;
+          break;
+        }
+      }
+    }
+    if (!scope) return;
 
     const isWrite = isWriteTool(toolName, this.config.assumeUnknownToolsAreWrites);
     if (isWrite) {
-      run.hasWriteSideEffects = true;
-      run.writeToolNames.push(toolName);
+      scope.hasWriteSideEffects = true;
+      scope.writeToolNames.push(toolName);
     }
     this.log(
-      `Agent ${agentId} tool call: ${toolName} (classified as ${isWrite ? "write" : "read"})`,
+      `Scope ${scope.scopeKey} tool: ${toolName} (${isWrite ? "write" : "read"})`,
     );
   }
 
   // ---------------------------------------------------------------------------
-  // after_agent_complete: deliver / suppress / reinject
+  // after_agent_complete: deliver / reinject with buffered messages
   // ---------------------------------------------------------------------------
 
   getDecision(agentId: string, channelKey: string, draftResponse: string): SpeedtrapDecision {
-    const run = agentRuns.get(agentId);
-    const channel = channels.get(channelKey);
-
+    const scopeKey = buildScopeKey(agentId, channelKey);
+    const scope = scopes.get(scopeKey);
     const preview = truncate(draftResponse, 200);
 
-    // No tracked run — let it through (conservative)
-    if (!run) {
+    if (!scope) {
+      this.log(`Scope ${scopeKey}: no tracked scope → delivering\n  response: ${preview}`);
+      return { action: "deliver" };
+    }
+
+    const hasBufferedMessages = scope.bufferedMessages.length > 0;
+
+    if (!hasBufferedMessages) {
+      // No new messages arrived — deliver and clean up
+      scopes.delete(scopeKey);
+      this.log(`Scope ${scopeKey}: no buffered messages → delivering\n  response: ${preview}`);
+      return { action: "deliver" };
+    }
+
+    // New messages arrived during processing — reinject
+    if (scope.reinjectCount >= this.config.maxReinjects) {
+      scopes.delete(scopeKey);
       this.log(
-        `Agent ${agentId} completed on ${channelKey}: no tracked run → delivering\n  response: ${preview}`,
+        `Scope ${scopeKey}: reinject budget exhausted (${scope.reinjectCount}), delivering\n  response: ${preview}`,
       );
       return { action: "deliver" };
     }
 
-    const currentTimestamp = channel?.lastMessageTimestamp ?? 0;
-    const channelMoved = currentTimestamp > run.startedAt;
-
-    if (!channelMoved) {
-      agentRuns.delete(agentId);
-      this.log(
-        `Agent ${agentId} completed on ${channelKey}: channel unchanged → delivering\n  response: ${preview}`,
-      );
-      return { action: "deliver" };
-    }
-
-    if (run.hasWriteSideEffects) {
-      if (run.reinjectCount >= this.config.maxReinjects) {
-        agentRuns.delete(agentId);
-        this.log(
-          `Agent ${agentId} on ${channelKey}: reinject budget exhausted (${run.reinjectCount}), delivering\n  response: ${preview}`,
-        );
-        return { action: "deliver" };
-      }
-      // Keep the run state — we'll see it again after core re-runs the agent
-      run.reinjectCount++;
-      this.log(
-        `Agent ${agentId} on ${channelKey}: channel moved, has writes → reinjecting (${run.reinjectCount}/${this.config.maxReinjects})\n  response: ${preview}`,
-      );
-      const context = buildWriteReinjectionPrompt(draftResponse, run.writeToolNames);
-      return { action: "reinject", context };
-    }
-
-    agentRuns.delete(agentId);
+    scope.reinjectCount++;
+    const buffered = scope.bufferedMessages.splice(0);
     this.log(
-      `Agent ${agentId} completed on ${channelKey}: channel moved, no writes → discarding\n  response: ${preview}`,
+      `Scope ${scopeKey}: ${buffered.length} buffered message(s) → reinjecting (${scope.reinjectCount}/${this.config.maxReinjects})\n  response: ${preview}`,
     );
-    return { action: "suppress" };
+
+    const context = buildReinjectionPrompt(
+      draftResponse,
+      buffered.map((m) => m.content),
+      scope.hasWriteSideEffects ? scope.writeToolNames : [],
+    );
+
+    // Reset write tracking for the reinject run
+    scope.writeToolNames = [];
+    scope.hasWriteSideEffects = false;
+
+    return { action: "reinject", context };
+  }
+
+  /** Clean up scope when a run ends (for any reason). */
+  cleanupScope(agentId: string, channelKey: string): void {
+    const scopeKey = buildScopeKey(agentId, channelKey);
+    const scope = scopes.get(scopeKey);
+    if (scope) {
+      scope.processing = false;
+    }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Reinjection prompt for write-side-effect runs
+// Reinjection prompt
 // ---------------------------------------------------------------------------
 
-function buildWriteReinjectionPrompt(draftResponse: string, writeToolNames: string[]): string {
-  const toolList = [...new Set(writeToolNames)].join(", ");
-  return [
-    "[SPEEDTRAP: CHANNEL MOVED DURING YOUR RUN]",
+function buildReinjectionPrompt(
+  draftResponse: string,
+  newMessages: string[],
+  writeToolNames: string[],
+): string {
+  const lines = [
+    "[SPEEDTRAP: NEW MESSAGES ARRIVED DURING YOUR RUN]",
     "",
-    "New messages appeared on the channel while you were working.",
-    `You executed write operations (${toolList}) — those side effects already happened.`,
-    "",
-    "Your drafted response:",
+    "While you were processing, the following new messages arrived on the channel:",
+  ];
+
+  for (const msg of newMessages) {
+    lines.push(`- "${msg}"`);
+  }
+
+  lines.push("");
+
+  if (writeToolNames.length > 0) {
+    const toolList = [...new Set(writeToolNames)].join(", ");
+    lines.push(
+      `You executed write operations (${toolList}) — those side effects already happened.`,
+      "",
+    );
+  }
+
+  lines.push(
+    "Your drafted response to the original message:",
     draftResponse,
     "",
-    "Revise your response to account for the new channel activity.",
-    "You must still confirm what you did (the writes already happened),",
-    "but adapt your message to the current conversation state.",
-    "Do not mention this notice in your response.",
-  ].join("\n");
+    "Revise your response to incorporate the new messages.",
+    "If the new messages make your response irrelevant, you may respond differently.",
+  );
+  if (writeToolNames.length > 0) {
+    lines.push("You must still confirm the write operations you performed.");
+  }
+  lines.push("Do not mention this notice in your response.");
+
+  return lines.join("\n");
 }
 
 function truncate(text: string, maxLen: number): string {

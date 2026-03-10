@@ -1,7 +1,7 @@
 /**
  * Speedtrap — Types
  *
- * Minimal state model: per-channel timestamps + per-agent-run metadata.
+ * Absorb + reinject model: per-scope state tracking buffered messages.
  */
 
 export type SpeedtrapConfig = {
@@ -25,24 +25,21 @@ export const DEFAULT_CONFIG: SpeedtrapConfig = {
 };
 
 /**
- * Per-channel state: just a timestamp of the last message seen.
+ * Per-scope state: tracks whether an agent is processing for a given
+ * agent+channel combination, and buffers messages that arrive during processing.
  */
-export type ChannelState = {
-  channelKey: string;
-  lastMessageTimestamp: number;
-};
-
-/**
- * Per-agent-run state: snapshot of channel timestamp at start + write tracking.
- */
-export type AgentRunState = {
+export type ScopeState = {
+  scopeKey: string;
   agentId: string;
-  /** Wall-clock time (Date.now()) when the agent started processing. */
-  startedAt: number;
-  hasWriteSideEffects: boolean;
+  channelKey: string;
+  /** Whether an agent is currently processing for this scope. */
+  processing: boolean;
+  /** Messages that arrived while the agent was processing. */
+  bufferedMessages: Array<{ content: string; timestamp: number }>;
   /** Names of write tools invoked during this run (for reinjection context). */
   writeToolNames: string[];
-  /** How many times this run has been reinjected. */
+  hasWriteSideEffects: boolean;
+  /** How many times this scope has been reinjected. */
   reinjectCount: number;
 };
 
@@ -51,5 +48,4 @@ export type AgentRunState = {
  */
 export type SpeedtrapDecision =
   | { action: "deliver" }
-  | { action: "suppress" }
   | { action: "reinject"; context: string };

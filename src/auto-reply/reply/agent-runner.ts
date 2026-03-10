@@ -385,6 +385,12 @@ export async function runReplyAgent(params: {
         fallbackAttempts,
         directlySentBlockKeys,
       } = runOutcome;
+
+      // Speedtrap absorb: plugin suppressed this run via before_agent_start
+      if (runResult.meta?.suppressed) {
+        return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
+      }
+
       let { didLogHeartbeatStrip, autoCompactionCompleted } = runOutcome;
 
       if (

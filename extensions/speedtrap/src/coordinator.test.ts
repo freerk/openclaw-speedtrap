@@ -17,282 +17,263 @@ function createCoordinator(overrides: Partial<SpeedtrapConfig> = {}): {
   return { coordinator, logs };
 }
 
-// Use timestamps far in the future so they're always > Date.now() when needed
-const FUTURE = Date.now() + 60_000;
-
-describe("SpeedtrapCoordinator", () => {
+describe("SpeedtrapCoordinator — Absorb + Reinject", () => {
   beforeEach(() => {
     resetSharedState();
   });
 
-  describe("channel unchanged → deliver", () => {
-    it("delivers when no new messages arrived after agent start", () => {
+  describe("no buffered messages → deliver", () => {
+    it("delivers when no new messages arrived during processing", () => {
       const { coordinator } = createCoordinator();
 
-      // Message arrives, agent starts, no new messages
-      coordinator.onMessageReceived("ch:1", Date.now() - 100);
-      coordinator.onAgentStart("agent-a");
-      // No new message_received after agent start
+      coordinator.onMessageReceived("ch:1", "hello", Date.now());
+      coordinator.shouldSuppressAgentStart("agent-a", "ch:1");
+      // No new messages arrive
       const decision = coordinator.getDecision("agent-a", "ch:1", "my response");
 
       expect(decision.action).toBe("deliver");
     });
-  });
 
-  describe("channel moved, no writes → suppress", () => {
-    it("suppresses when channel moved and agent had no write side effects", () => {
+    it("delivers when no tracked scope exists (conservative)", () => {
       const { coordinator } = createCoordinator();
-
-      coordinator.onAgentStart("agent-a");
-      // Message arrives after agent started
-      coordinator.onMessageReceived("ch:1", FUTURE);
-      const decision = coordinator.getDecision("agent-a", "ch:1", "my response");
-
-      expect(decision.action).toBe("suppress");
-    });
-
-    it("suppresses when agent only used read-only tools", () => {
-      const { coordinator } = createCoordinator();
-
-      coordinator.onAgentStart("agent-a");
-      coordinator.onToolCall("agent-a", "memory_search");
-      coordinator.onToolCall("agent-a", "web_search");
-      coordinator.onToolCall("agent-a", "file_read");
-      // Channel moves after agent started
-      coordinator.onMessageReceived("ch:1", FUTURE);
-      const decision = coordinator.getDecision("agent-a", "ch:1", "my response");
-
-      expect(decision.action).toBe("suppress");
+      expect(coordinator.getDecision("unknown", "ch:1", "resp").action).toBe("deliver");
     });
   });
 
-  describe("channel moved, has writes → reinject", () => {
-    it("reinjects when agent had write side effects and channel moved", () => {
+  describe("absorb → suppress duplicate agent trigger", () => {
+    it("suppresses second agent run for same scope", () => {
       const { coordinator } = createCoordinator();
 
-      coordinator.onAgentStart("agent-a");
-      coordinator.onToolCall("agent-a", "write_file");
-      coordinator.onMessageReceived("ch:1", FUTURE);
-      const decision = coordinator.getDecision("agent-a", "ch:1", "I wrote to config.json");
+      // First agent starts
+      expect(coordinator.shouldSuppressAgentStart("agent-a", "ch:1")).toBe(false);
+      // Second trigger for same scope
+      expect(coordinator.shouldSuppressAgentStart("agent-a", "ch:1")).toBe(true);
+    });
+
+    it("allows agent runs on different channels", () => {
+      const { coordinator } = createCoordinator();
+
+      expect(coordinator.shouldSuppressAgentStart("agent-a", "ch:1")).toBe(false);
+      expect(coordinator.shouldSuppressAgentStart("agent-a", "ch:2")).toBe(false);
+    });
+
+    it("allows different agents on same channel", () => {
+      const { coordinator } = createCoordinator();
+
+      expect(coordinator.shouldSuppressAgentStart("agent-a", "ch:1")).toBe(false);
+      expect(coordinator.shouldSuppressAgentStart("agent-b", "ch:1")).toBe(false);
+    });
+  });
+
+  describe("message buffering during processing", () => {
+    it("buffers messages when scope is processing", () => {
+      const { coordinator, logs } = createCoordinator();
+
+      coordinator.shouldSuppressAgentStart("agent-a", "ch:1");
+      coordinator.onMessageReceived("ch:1", "new message", Date.now());
+
+      expect(logs.some((l) => l.includes("buffered message (1 total)"))).toBe(true);
+    });
+
+    it("buffers multiple messages", () => {
+      const { coordinator, logs } = createCoordinator();
+
+      coordinator.shouldSuppressAgentStart("agent-a", "ch:1");
+      coordinator.onMessageReceived("ch:1", "msg 1", Date.now());
+      coordinator.onMessageReceived("ch:1", "msg 2", Date.now());
+
+      expect(logs.some((l) => l.includes("buffered message (2 total)"))).toBe(true);
+    });
+
+    it("does not buffer when no scope is processing", () => {
+      const { coordinator, logs } = createCoordinator();
+
+      coordinator.onMessageReceived("ch:1", "hello", Date.now());
+
+      expect(logs.some((l) => l.includes("no active scope to buffer"))).toBe(true);
+    });
+  });
+
+  describe("reinject when buffered messages exist", () => {
+    it("reinjects when messages arrived during processing", () => {
+      const { coordinator } = createCoordinator();
+
+      coordinator.shouldSuppressAgentStart("agent-a", "ch:1");
+      coordinator.onMessageReceived("ch:1", "follow-up question", Date.now());
+
+      const decision = coordinator.getDecision("agent-a", "ch:1", "my draft response");
+
+      expect(decision.action).toBe("reinject");
+      if (decision.action === "reinject") {
+        expect(decision.context).toContain("follow-up question");
+        expect(decision.context).toContain("my draft response");
+        expect(decision.context).toContain("NEW MESSAGES ARRIVED");
+      }
+    });
+
+    it("includes all buffered messages in reinject context", () => {
+      const { coordinator } = createCoordinator();
+
+      coordinator.shouldSuppressAgentStart("agent-a", "ch:1");
+      coordinator.onMessageReceived("ch:1", "msg one", Date.now());
+      coordinator.onMessageReceived("ch:1", "msg two", Date.now());
+
+      const decision = coordinator.getDecision("agent-a", "ch:1", "draft");
+
+      expect(decision.action).toBe("reinject");
+      if (decision.action === "reinject") {
+        expect(decision.context).toContain("msg one");
+        expect(decision.context).toContain("msg two");
+      }
+    });
+
+    it("includes write tool info in reinject context", () => {
+      const { coordinator } = createCoordinator();
+
+      coordinator.shouldSuppressAgentStart("agent-a", "ch:1");
+      coordinator.onToolCall("agent-a", "ch:1", "write_file");
+      coordinator.onMessageReceived("ch:1", "new msg", Date.now());
+
+      const decision = coordinator.getDecision("agent-a", "ch:1", "draft");
 
       expect(decision.action).toBe("reinject");
       if (decision.action === "reinject") {
         expect(decision.context).toContain("write_file");
-        expect(decision.context).toContain("I wrote to config.json");
-        expect(decision.context).toContain("CHANNEL MOVED");
       }
     });
 
-    it("reinjects when unknown tool used with assumeUnknownToolsAreWrites=true", () => {
-      const { coordinator } = createCoordinator({ assumeUnknownToolsAreWrites: true });
-
-      coordinator.onAgentStart("agent-a");
-      coordinator.onToolCall("agent-a", "some_custom_tool");
-      coordinator.onMessageReceived("ch:1", FUTURE);
-      const decision = coordinator.getDecision("agent-a", "ch:1", "done");
-
-      expect(decision.action).toBe("reinject");
-    });
-
-    it("deduplicates tool names in reinjection context", () => {
+    it("does not include tool info when only read tools used", () => {
       const { coordinator } = createCoordinator();
 
-      coordinator.onAgentStart("agent-a");
-      coordinator.onToolCall("agent-a", "write_file");
-      coordinator.onToolCall("agent-a", "write_file");
-      coordinator.onToolCall("agent-a", "bash");
-      coordinator.onMessageReceived("ch:1", FUTURE);
-      const decision = coordinator.getDecision("agent-a", "ch:1", "done");
+      coordinator.shouldSuppressAgentStart("agent-a", "ch:1");
+      coordinator.onToolCall("agent-a", "ch:1", "memory_search");
+      coordinator.onMessageReceived("ch:1", "new msg", Date.now());
+
+      const decision = coordinator.getDecision("agent-a", "ch:1", "draft");
 
       expect(decision.action).toBe("reinject");
       if (decision.action === "reinject") {
-        expect(decision.context).toContain("write_file, bash");
+        expect(decision.context).not.toContain("write operations");
       }
     });
   });
 
-  describe("assumeUnknownToolsAreWrites=false", () => {
-    it("suppresses when unknown tool used with assumeUnknownToolsAreWrites=false", () => {
-      const { coordinator } = createCoordinator({ assumeUnknownToolsAreWrites: false });
+  describe("reinject budget", () => {
+    it("delivers after maxReinjects is reached", () => {
+      const { coordinator } = createCoordinator({ maxReinjects: 2 });
 
-      coordinator.onAgentStart("agent-a");
-      coordinator.onToolCall("agent-a", "some_custom_tool");
-      coordinator.onMessageReceived("ch:1", FUTURE);
-      const decision = coordinator.getDecision("agent-a", "ch:1", "done");
+      coordinator.shouldSuppressAgentStart("agent-a", "ch:1");
+      coordinator.onMessageReceived("ch:1", "msg 1", Date.now());
 
-      expect(decision.action).toBe("suppress");
-    });
-  });
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-1").action).toBe("reinject");
+      // Buffer another message for the second reinject
+      coordinator.onMessageReceived("ch:1", "msg 2", Date.now());
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-2").action).toBe("reinject");
 
-  describe("thundering herd scenario", () => {
-    it("fastest agent delivers, slower agents get discarded", () => {
-      const { coordinator } = createCoordinator();
-
-      // All 3 agents start processing
-      coordinator.onAgentStart("agent-a");
-      coordinator.onAgentStart("agent-b");
-      coordinator.onAgentStart("agent-c");
-
-      // Agent A finishes first — no new messages on channel
-      expect(coordinator.getDecision("agent-a", "ch:1", "resp-a").action).toBe("deliver");
-
-      // Agent A's response appears as a new message on the channel
-      coordinator.onMessageReceived("ch:1", FUTURE);
-
-      // Agent B finishes — channel moved
-      expect(coordinator.getDecision("agent-b", "ch:1", "resp-b").action).toBe("suppress");
-
-      // Agent C finishes — channel still moved
-      expect(coordinator.getDecision("agent-c", "ch:1", "resp-c").action).toBe("suppress");
-    });
-  });
-
-  describe("cascade self-extinguishing", () => {
-    it("cascade-triggered runs get discarded as channel keeps moving", () => {
-      const { coordinator } = createCoordinator();
-
-      // Agent A starts
-      coordinator.onAgentStart("agent-a");
-
-      // Agent A finishes + delivers (no channel movement)
-      expect(coordinator.getDecision("agent-a", "ch:1", "resp").action).toBe("deliver");
-
-      // Agent A's response triggers agent B (cascade)
-      coordinator.onMessageReceived("ch:1", FUTURE);
-      coordinator.onAgentStart("agent-b");
-
-      // Another message appears (even further in the future)
-      coordinator.onMessageReceived("ch:1", FUTURE + 1000);
-
-      // Agent B finishes — channel moved
-      expect(coordinator.getDecision("agent-b", "ch:1", "resp").action).toBe("suppress");
-    });
-  });
-
-  describe("no tracked run → deliver (conservative)", () => {
-    it("delivers when no run state exists for the agent", () => {
-      const { coordinator } = createCoordinator();
-
-      const decision = coordinator.getDecision("unknown-agent", "ch:1", "resp");
-      expect(decision.action).toBe("deliver");
+      // Budget exhausted — deliver even if more messages come
+      coordinator.onMessageReceived("ch:1", "msg 3", Date.now());
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-3").action).toBe("deliver");
     });
   });
 
   describe("multi-channel isolation", () => {
-    it("channel movement on one channel does not affect another", () => {
+    it("buffers only affect the correct channel scope", () => {
       const { coordinator } = createCoordinator();
 
-      coordinator.onAgentStart("agent-a");
-      coordinator.onAgentStart("agent-b");
+      coordinator.shouldSuppressAgentStart("agent-a", "ch:1");
+      coordinator.shouldSuppressAgentStart("agent-a", "ch:2");
 
-      // Only ch:1 gets a new message
-      coordinator.onMessageReceived("ch:1", FUTURE);
+      // Message only on ch:1
+      coordinator.onMessageReceived("ch:1", "new msg", Date.now());
 
-      expect(coordinator.getDecision("agent-a", "ch:1", "resp").action).toBe("suppress");
-      // ch:2 has no messages at all, so lastMessageTimestamp=0 < startedAt
-      expect(coordinator.getDecision("agent-b", "ch:2", "resp").action).toBe("deliver");
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft").action).toBe("reinject");
+      expect(coordinator.getDecision("agent-a", "ch:2", "draft").action).toBe("deliver");
     });
   });
 
-  describe("run state cleanup", () => {
-    it("cleans up run state after getDecision", () => {
+  describe("scope cleanup", () => {
+    it("cleans up scope after deliver", () => {
       const { coordinator } = createCoordinator();
 
-      coordinator.onAgentStart("agent-a");
+      coordinator.shouldSuppressAgentStart("agent-a", "ch:1");
+      coordinator.getDecision("agent-a", "ch:1", "draft");
 
-      // First call cleans up
-      coordinator.getDecision("agent-a", "ch:1", "resp");
+      // Scope cleaned up — new agent can start
+      expect(coordinator.shouldSuppressAgentStart("agent-a", "ch:1")).toBe(false);
+    });
 
-      // Second call has no state → conservative deliver
-      expect(coordinator.getDecision("agent-a", "ch:1", "resp").action).toBe("deliver");
+    it("keeps scope alive during reinject cycle", () => {
+      const { coordinator } = createCoordinator();
+
+      coordinator.shouldSuppressAgentStart("agent-a", "ch:1");
+      coordinator.onMessageReceived("ch:1", "msg", Date.now());
+
+      // Reinject — scope stays alive
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft").action).toBe("reinject");
+
+      // Should still suppress new runs for this scope during reinject
+      expect(coordinator.shouldSuppressAgentStart("agent-a", "ch:1")).toBe(true);
     });
   });
 
-  describe("debug logging", () => {
-    it("logs suppress decisions", () => {
-      const { coordinator, logs } = createCoordinator();
+  describe("tool call tracking with agentId fallback", () => {
+    it("tracks tool calls when channelKey is not provided", () => {
+      const { coordinator } = createCoordinator();
 
-      coordinator.onAgentStart("agent-a");
-      coordinator.onToolCall("agent-a", "memory_search");
-      coordinator.onMessageReceived("ch:1", FUTURE);
-      coordinator.getDecision("agent-a", "ch:1", "resp");
-
-      expect(logs.some((l) => l.includes("Agent agent-a started"))).toBe(true);
-      expect(logs).toContain("Agent agent-a tool call: memory_search (classified as read)");
-      expect(logs.some((l) => l.includes("channel moved, no writes → discarding"))).toBe(true);
-    });
-
-    it("logs reinject decisions", () => {
-      const { coordinator, logs } = createCoordinator();
-
-      coordinator.onAgentStart("agent-a");
-      coordinator.onToolCall("agent-a", "bash");
-      coordinator.onMessageReceived("ch:1", FUTURE);
-      coordinator.getDecision("agent-a", "ch:1", "resp");
-
-      expect(logs.some((l) => l.includes("channel moved, has writes → reinjecting (1/3)"))).toBe(
-        true,
-      );
-    });
-  });
-
-  describe("reinject budget exhaustion", () => {
-    it("delivers after maxReinjects is reached", () => {
-      const { coordinator } = createCoordinator({ maxReinjects: 2 });
-
-      coordinator.onAgentStart("agent-a");
-      coordinator.onToolCall("agent-a", "bash");
-      coordinator.onMessageReceived("ch:1", FUTURE);
-
-      // First two calls reinject
-      expect(coordinator.getDecision("agent-a", "ch:1", "draft-1").action).toBe("reinject");
-      expect(coordinator.getDecision("agent-a", "ch:1", "draft-2").action).toBe("reinject");
-
-      // Third call: budget exhausted, forced delivery
-      expect(coordinator.getDecision("agent-a", "ch:1", "draft-3").action).toBe("deliver");
-    });
-
-    it("cleans up run state after budget exhaustion", () => {
-      const { coordinator } = createCoordinator({ maxReinjects: 1 });
-
-      coordinator.onAgentStart("agent-a");
-      coordinator.onToolCall("agent-a", "bash");
-      coordinator.onMessageReceived("ch:1", FUTURE);
-
-      expect(coordinator.getDecision("agent-a", "ch:1", "draft-1").action).toBe("reinject");
-      expect(coordinator.getDecision("agent-a", "ch:1", "draft-2").action).toBe("deliver");
-
-      // State cleaned up — falls back to conservative deliver
-      expect(coordinator.getDecision("agent-a", "ch:1", "draft-3").action).toBe("deliver");
-    });
-
-    it("preserves write tool tracking across reinjects", () => {
-      const { coordinator } = createCoordinator({ maxReinjects: 2 });
-
-      coordinator.onAgentStart("agent-a");
-      coordinator.onToolCall("agent-a", "write_file");
-      coordinator.onMessageReceived("ch:1", FUTURE);
+      coordinator.shouldSuppressAgentStart("agent-a", "ch:1");
+      // Tool call without channelKey — falls back to agentId lookup
+      coordinator.onToolCall("agent-a", undefined, "bash");
+      coordinator.onMessageReceived("ch:1", "msg", Date.now());
 
       const decision = coordinator.getDecision("agent-a", "ch:1", "draft");
       expect(decision.action).toBe("reinject");
       if (decision.action === "reinject") {
-        expect(decision.context).toContain("write_file");
+        expect(decision.context).toContain("bash");
       }
     });
   });
 
-  describe("run state cleanup on reinject vs deliver/suppress", () => {
-    it("keeps run state alive during reinject cycle", () => {
-      const { coordinator } = createCoordinator({ maxReinjects: 3 });
+  describe("end-to-end absorb + reinject flow", () => {
+    it("full flow: absorb trigger, buffer message, reinject, then deliver", () => {
+      const { coordinator } = createCoordinator();
 
-      coordinator.onAgentStart("agent-a");
-      coordinator.onToolCall("agent-a", "bash");
-      coordinator.onMessageReceived("ch:1", FUTURE);
+      // 1. Message A arrives, agent starts
+      coordinator.onMessageReceived("ch:1", "hello", Date.now());
+      expect(coordinator.shouldSuppressAgentStart("agent-a", "ch:1")).toBe(false);
 
-      // Reinject keeps state
-      expect(coordinator.getDecision("agent-a", "ch:1", "draft-1").action).toBe("reinject");
-      // State still there for next decision
-      expect(coordinator.getDecision("agent-a", "ch:1", "draft-2").action).toBe("reinject");
+      // 2. Message B arrives while processing — gets buffered
+      coordinator.onMessageReceived("ch:1", "also, can you...", Date.now());
+
+      // 3. Message B's agent trigger is suppressed
+      expect(coordinator.shouldSuppressAgentStart("agent-a", "ch:1")).toBe(true);
+
+      // 4. Agent finishes A — sees buffered messages — reinjects
+      const decision1 = coordinator.getDecision("agent-a", "ch:1", "Here's my response to hello");
+      expect(decision1.action).toBe("reinject");
+      if (decision1.action === "reinject") {
+        expect(decision1.context).toContain("also, can you...");
+        expect(decision1.context).toContain("Here's my response to hello");
+      }
+
+      // 5. No more messages — deliver
+      const decision2 = coordinator.getDecision("agent-a", "ch:1", "Updated response");
+      expect(decision2.action).toBe("deliver");
+    });
+  });
+
+  describe("debug logging", () => {
+    it("logs key decisions", () => {
+      const { coordinator, logs } = createCoordinator();
+
+      coordinator.shouldSuppressAgentStart("agent-a", "ch:1");
+      coordinator.onToolCall("agent-a", "ch:1", "memory_search");
+      coordinator.onMessageReceived("ch:1", "msg", Date.now());
+      coordinator.getDecision("agent-a", "ch:1", "resp");
+
+      expect(logs.some((l) => l.includes("agent start, marked as processing"))).toBe(true);
+      expect(logs.some((l) => l.includes("memory_search (read)"))).toBe(true);
+      expect(logs.some((l) => l.includes("buffered message"))).toBe(true);
+      expect(logs.some((l) => l.includes("reinjecting"))).toBe(true);
     });
   });
 });

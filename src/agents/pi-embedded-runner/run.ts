@@ -321,6 +321,7 @@ export async function runEmbeddedPiAgent(
         messageProvider: params.messageProvider ?? undefined,
         trigger: params.trigger,
         channelId: params.messageChannel ?? params.messageProvider ?? undefined,
+        conversationId: params.messageTo ?? undefined,
       };
       if (hookRunner?.hasHooks("before_model_resolve")) {
         try {
@@ -350,6 +351,17 @@ export async function runEmbeddedPiAgent(
             `before_agent_start hook (legacy model resolve path) failed: ${String(hookErr)}`,
           );
         }
+      }
+      // Speedtrap absorb: plugin requested suppression of this agent run
+      if (legacyBeforeAgentStartResult?.suppress) {
+        log.info("[hooks] before_agent_start: run suppressed by plugin");
+        return {
+          payloads: [],
+          meta: {
+            durationMs: 0,
+            suppressed: true,
+          },
+        };
       }
       if (modelResolveOverride?.providerOverride) {
         provider = modelResolveOverride.providerOverride;
