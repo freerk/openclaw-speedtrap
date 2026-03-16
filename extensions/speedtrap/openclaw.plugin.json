@@ -1,0 +1,27 @@
+{
+  "id": "speedtrap",
+  "name": "Speedtrap",
+  "description": "Discard stale agent responses when a channel moved during processing. No reinjection, no buffering — if the channel moved and the agent did no writes, the response is dropped.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "assumeUnknownToolsAreWrites": {
+        "type": "boolean"
+      },
+      "debug": {
+        "type": "boolean"
+      }
+    }
+  },
+  "uiHints": {
+    "assumeUnknownToolsAreWrites": {
+      "label": "Unknown Tools = Writes",
+      "help": "When true, unrecognized tools are assumed to have write side effects. This forces delivery for unknown tool calls, which is safer than silently discarding. Default: true"
+    },
+    "debug": {
+      "label": "Debug Logging",
+      "help": "Log all Speedtrap decisions to console"
+    }
+  }
+}
