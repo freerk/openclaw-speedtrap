@@ -8,19 +8,17 @@
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/speedtrap";
 import { buildPhysicalChannelKey } from "./channel-key.js";
-import { SpeedtrapCoordinator, getGlobalState } from "./coordinator.js";
+import { SpeedtrapCoordinator } from "./coordinator.js";
 import { DEFAULT_CONFIG, type SpeedtrapConfig } from "./types.js";
 
 export function registerSpeedtrapHooks(api: OpenClawPluginApi): void {
-  // Guard via globalThis: register() is called once per jiti module instance
-  // (each loadOpenClawPlugins cache miss creates a fresh jiti loader), but
-  // hooks must only be wired once so the coordinator sees each event exactly
-  // once. Module-level guards don't work across jiti instances.
-  const state = getGlobalState();
-  if (state.hooksRegistered) {
-    return;
-  }
-  state.hooksRegistered = true;
+  // No registration guard: each loadOpenClawPlugins() call creates a new
+  // plugin registry and may replace the global hook runner via
+  // activatePluginRegistry(). Hooks must be present in every registry so
+  // whichever one becomes the active runner has them. Duplicate handlers
+  // across registries are not a problem because the runner only uses one
+  // registry at a time. All coordinator instances share state via globalThis
+  // (see coordinator.ts).
 
   const pluginCfg = (api.pluginConfig ?? {}) as Partial<SpeedtrapConfig>;
   const config: SpeedtrapConfig = {

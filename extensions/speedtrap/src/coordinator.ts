@@ -37,19 +37,17 @@ import type { AgentRunState, ChannelState, SpeedtrapDecision, SpeedtrapConfig } 
 type SpeedtrapGlobalState = {
   channels: Map<string, ChannelState>;
   agentRuns: Map<string, AgentRunState>;
-  hooksRegistered: boolean;
 };
 
 const GLOBAL_STATE_KEY = Symbol.for("openclaw.speedtrap.shared-state");
 
-export function getGlobalState(): SpeedtrapGlobalState {
+function getGlobalState(): SpeedtrapGlobalState {
   const store = globalThis as typeof globalThis & {
     [GLOBAL_STATE_KEY]?: SpeedtrapGlobalState;
   };
   return (store[GLOBAL_STATE_KEY] ??= {
     channels: new Map(),
     agentRuns: new Map(),
-    hooksRegistered: false,
   });
 }
 
@@ -62,7 +60,6 @@ export function resetSharedState(): void {
   const state = getGlobalState();
   state.channels.clear();
   state.agentRuns.clear();
-  state.hooksRegistered = false;
 }
 
 export class SpeedtrapCoordinator {
