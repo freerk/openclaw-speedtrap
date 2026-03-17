@@ -72,6 +72,7 @@ export class SpeedtrapCoordinator {
   // ---------------------------------------------------------------------------
 
   onMessageReceived(channelKey: string): void {
+    this.pruneStaleRuns();
     let marked = 0;
     for (const run of agentRuns.values()) {
       if (run.channelKey === channelKey && run.active) {
@@ -133,6 +134,7 @@ export class SpeedtrapCoordinator {
     agentRuns.set(runKey, {
       agentId,
       channelKey,
+      startedAt: Date.now(),
       channelDirty: false,
       hasWriteSideEffects: false,
       writeToolNames: [],
@@ -279,6 +281,21 @@ export class SpeedtrapCoordinator {
   private pruneExpiredPending(run: AgentRunState): void {
     const cutoff = Date.now() - this.config.pendingTtlMs;
     run.pending = run.pending.filter((p) => p.ts >= cutoff);
+  }
+
+  /**
+   * Remove runs older than 30 minutes (likely orphaned by crashes or timeouts).
+   * This is a safety net, not a primary cleanup mechanism. Normal runs are
+   * deleted by getDecision on terminal outcomes (deliver/suppress).
+   */
+  private pruneStaleRuns(): void {
+    const STALE_RUN_TTL_MS = 30 * 60 * 1000;
+    const cutoff = Date.now() - STALE_RUN_TTL_MS;
+    for (const [key, run] of agentRuns) {
+      if (run.startedAt < cutoff) {
+        agentRuns.delete(key);
+      }
+    }
   }
 }
 

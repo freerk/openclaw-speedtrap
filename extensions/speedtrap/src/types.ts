@@ -69,6 +69,8 @@ export interface PendingInbound {
 export interface AgentRunState {
   agentId: string;
   channelKey: string;
+  /** Timestamp when this run was created or last reinjected. Used for stale run cleanup. */
+  startedAt: number;
   /** True if any message arrived on the channel after this run started. */
   channelDirty: boolean;
   hasWriteSideEffects: boolean;
