@@ -21,25 +21,48 @@
  *     not wall-clock timestamps. This avoids races where the agent's
  *     own triggering message could register as "channel moved".
  *
- * State is module-level (shared singleton):
- *   The plugin may be instantiated multiple times across subsystems
- *   (e.g. "gateway" and "plugins"), each with its own coordinator.
- *   Different hooks for the same agent run can fire through different
- *   subsystems. Module-level Maps ensure all instances share state.
+ * State lives on globalThis via Symbol.for():
+ *   The plugin is loaded through jiti, which creates a fresh module
+ *   instance per loadOpenClawPlugins() call (each call builds a new
+ *   jiti loader). Module-level variables would be separate per instance,
+ *   breaking cross-subsystem state sharing. Using globalThis with a
+ *   well-known Symbol key ensures all instances in the same process
+ *   share the same Maps, regardless of how many times the module is
+ *   imported.
  */
 
 import { isWriteTool } from "./classifier.js";
 import type { AgentRunState, ChannelState, SpeedtrapDecision, SpeedtrapConfig } from "./types.js";
 
+type SpeedtrapGlobalState = {
+  channels: Map<string, ChannelState>;
+  agentRuns: Map<string, AgentRunState>;
+  hooksRegistered: boolean;
+};
+
+const GLOBAL_STATE_KEY = Symbol.for("openclaw.speedtrap.shared-state");
+
+export function getGlobalState(): SpeedtrapGlobalState {
+  const store = globalThis as typeof globalThis & {
+    [GLOBAL_STATE_KEY]?: SpeedtrapGlobalState;
+  };
+  return (store[GLOBAL_STATE_KEY] ??= {
+    channels: new Map(),
+    agentRuns: new Map(),
+    hooksRegistered: false,
+  });
+}
+
 // Shared across all coordinator instances so hooks firing from different
 // subsystems (gateway vs plugins) see the same state.
-const channels = new Map<string, ChannelState>();
-const agentRuns = new Map<string, AgentRunState>();
+const { channels, agentRuns } = getGlobalState();
 
 /** Reset shared state. Exported for tests only. */
 export function resetSharedState(): void {
-  channels.clear();
-  agentRuns.clear();
+  const state = getGlobalState();
+  state.channels.clear();
+  state.agentRuns.clear();
+  state.hooksRegistered = false;
 }
 
 export class SpeedtrapCoordinator {
