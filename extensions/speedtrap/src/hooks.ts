@@ -46,16 +46,18 @@ export function registerSpeedtrapHooks(api: OpenClawPluginApi): void {
   });
 
   api.on("inbound_claim", async (event, ctx) => {
+    log(
+      `inbound_claim hook fired: channelId=${ctx.channelId} conversationId=${ctx.conversationId}`,
+    );
     if (!ctx.channelId) return;
     const channelKey = buildPhysicalChannelKey(ctx.channelId, ctx.conversationId);
-    // inbound_claim fires before agent selection, so there's no agentId.
-    // Check if ANY active run exists on this channel.
     const claimed = coordinator.onInboundClaim(channelKey, {
       content: event.content ?? "",
       sender: event.senderName ?? event.senderId,
       messageId: event.messageId,
       ts: event.timestamp,
     });
+    log(`inbound_claim result: channelKey=${channelKey} claimed=${claimed}`);
     if (claimed) {
       return { handled: true };
     }

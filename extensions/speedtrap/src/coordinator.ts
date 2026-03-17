@@ -92,11 +92,15 @@ export class SpeedtrapCoordinator {
    */
   onInboundClaim(channelKey: string, message: PendingInbound): boolean {
     if (!this.config.coalesce || !this.config.claimWhileActive) {
+      this.log(
+        `Claim skip on ${channelKey}: coalesce=${this.config.coalesce} claimWhileActive=${this.config.claimWhileActive}`,
+      );
       return false;
     }
 
     const activeRuns = this.getActiveRunsOnChannel(channelKey);
     if (activeRuns.length === 0) {
+      this.log(`Claim skip on ${channelKey}: no active runs`);
       return false;
     }
 
