@@ -2,9 +2,11 @@
  * Speedtrap — Types
  *
  * Minimal state model: per-channel message counters + per-agent-run metadata.
+ * v2 adds coalescing: pending inbound buffer, claim gating, and richer
+ * reinjection decisions when the channel moves during a run.
  */
 
-export type SpeedtrapConfig = {
+export interface SpeedtrapConfig {
   /**
    * When true (default), unknown tools are assumed to have write side effects.
    * This is the conservative default — unknown tools force delivery even if
@@ -16,27 +18,55 @@ export type SpeedtrapConfig = {
   debug: boolean;
   /** Max reinject attempts before forcing delivery. Plugin-owned budget. */
   maxReinjects: number;
-};
+  /** Enable coalescing: buffer overlapping inbounds and reinject with context. */
+  coalesce: boolean;
+  /** Claim overlapping inbounds via inbound_claim while a run is active. */
+  claimWhileActive: boolean;
+  /** Max messages in the pending buffer per channel. Ring buffer: oldest dropped. */
+  maxBufferedMessages: number;
+  /** TTL for pending buffer entries in ms. Expired entries are pruned before use. */
+  pendingTtlMs: number;
+}
 
 export const DEFAULT_CONFIG: SpeedtrapConfig = {
   assumeUnknownToolsAreWrites: true,
   debug: false,
   maxReinjects: 3,
+  coalesce: false,
+  claimWhileActive: false,
+  maxBufferedMessages: 20,
+  pendingTtlMs: 900_000,
 };
+
+/**
+ * A buffered inbound message claimed while a run was active.
+ */
+export interface PendingInbound {
+  ts?: number;
+  sender?: string;
+  content: string;
+  messageId?: string;
+}
 
 /**
  * Per-channel state: monotonic counter of messages received.
- * Incremented on each message_received event.
  */
-export type ChannelState = {
+export interface ChannelState {
   channelKey: string;
   messageCount: number;
-};
+}
 
 /**
- * Per-agent-run state: snapshot of channel message count at start + write tracking.
+ * Per-agent-run state: snapshot of channel message count at start,
+ * write tracking, and per-agent pending buffer.
+ *
+ * Each agent accumulates messages that arrived while IT was processing.
+ * When agent A delivers, its response is buffered into all OTHER active
+ * agents' pending lists. When agent B gets reinjected, it consumes its
+ * own buffer (containing A's response). Agent C still has both A and B
+ * in its buffer until it completes.
  */
-export type AgentRunState = {
+export interface AgentRunState {
   agentId: string;
   channelKey: string;
   /** Channel message count when the agent started processing. */
@@ -46,7 +76,11 @@ export type AgentRunState = {
   writeToolNames: string[];
   /** How many times this run has been reinjected. */
   reinjectCount: number;
-};
+  /** Whether this run is currently active (between agent start and final decision). */
+  active: boolean;
+  /** Messages that arrived while this agent was processing. Per-agent, not per-channel. */
+  pending: PendingInbound[];
+}
 
 /**
  * Decision returned by the coordinator after an agent completes.

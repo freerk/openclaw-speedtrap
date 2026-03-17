@@ -251,7 +251,7 @@ describe("SpeedtrapCoordinator", () => {
 
       expect(logs.some((l) => l.includes("Agent agent-a started on ch:1"))).toBe(true);
       expect(logs).toContain("Agent agent-a tool call: memory_search (classified as read)");
-      expect(logs.some((l) => l.includes("channel moved, no writes → discarding"))).toBe(true);
+      expect(logs.some((l) => l.includes("channel moved, no writes, suppressing"))).toBe(true);
     });
 
     it("logs reinject decisions", () => {
@@ -262,7 +262,7 @@ describe("SpeedtrapCoordinator", () => {
       coordinator.onMessageReceived("ch:1");
       coordinator.getDecision("agent-a", "ch:1", "resp");
 
-      expect(logs.some((l) => l.includes("channel moved, has writes → reinjecting (1/3)"))).toBe(
+      expect(logs.some((l) => l.includes("channel moved, has writes, reinjecting (1/3)"))).toBe(
         true,
       );
     });
@@ -629,28 +629,30 @@ describe("SpeedtrapCoordinator", () => {
   });
 
   describe("isolation with coalescing", () => {
-    it("pending buffer is per-channel, not per-agent", () => {
+    it("pending buffer is per-agent-run, not per-channel", () => {
       const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: true });
 
       coordinator.onMessageReceived("ch:1");
-      coordinator.onMessageReceived("ch:2");
-
       coordinator.onAgentStart("agent-a", "ch:1");
-      coordinator.onAgentStart("agent-a", "ch:2");
+      coordinator.onAgentStart("agent-b", "ch:1");
 
-      // Buffer a message on ch:1 only
-      coordinator.onInboundClaim("ch:1", { content: "ch1-follow" });
-
+      // Claim distributes to both active runs
+      coordinator.onInboundClaim("ch:1", { content: "follow-up" });
       coordinator.onMessageReceived("ch:1");
-      coordinator.onMessageReceived("ch:2");
 
-      // ch:1 has pending → reinject
-      const d1 = coordinator.getDecision("agent-a", "ch:1", "resp");
-      expect(d1.action).toBe("reinject");
+      // Agent A reinjects (consumes its own buffer)
+      const dA = coordinator.getDecision("agent-a", "ch:1", "resp-a");
+      expect(dA.action).toBe("reinject");
+      if (dA.action === "reinject") {
+        expect(dA.context).toContain("follow-up");
+      }
 
-      // ch:2 has no pending → suppress (no writes, coalesce on, no pending)
-      const d2 = coordinator.getDecision("agent-a", "ch:2", "resp");
-      expect(d2.action).toBe("suppress");
+      // Agent B still has the message in its own buffer
+      const dB = coordinator.getDecision("agent-b", "ch:1", "resp-b");
+      expect(dB.action).toBe("reinject");
+      if (dB.action === "reinject") {
+        expect(dB.context).toContain("follow-up");
+      }
     });
 
     it("same agent on different channels has independent claim state", () => {
@@ -667,44 +669,46 @@ describe("SpeedtrapCoordinator", () => {
     });
   });
 
-  describe("pending buffer cleanup after terminal decision", () => {
-    it("clears pending buffer after deliver", () => {
+  describe("per-agent buffer lifecycle", () => {
+    it("consuming buffer on reinject does not affect other agents", () => {
       const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: true });
 
       coordinator.onMessageReceived("ch:1");
       coordinator.onAgentStart("agent-a", "ch:1");
-      coordinator.onInboundClaim("ch:1", { content: "buffered" });
+      coordinator.onAgentStart("agent-b", "ch:1");
+      coordinator.onInboundClaim("ch:1", { content: "msg-1" });
+      coordinator.onMessageReceived("ch:1");
 
-      // Channel unchanged → deliver (pending buffer cleared)
+      // Agent A reinjects and consumes its buffer
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-a").action).toBe("reinject");
+
+      // Agent A's buffer is now empty, second call with no new pending
+      // Channel still moved (count > snapshot), no writes, empty buffer → suppress
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-a2").action).toBe("suppress");
+
+      // Agent B still has msg-1 in its own buffer
+      const dB = coordinator.getDecision("agent-b", "ch:1", "draft-b");
+      expect(dB.action).toBe("reinject");
+      if (dB.action === "reinject") {
+        expect(dB.context).toContain("msg-1");
+      }
+    });
+
+    it("new run starts with empty buffer", () => {
+      const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: true });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+      coordinator.onInboundClaim("ch:1", { content: "old-msg" });
+
+      // Agent A delivers (channel unchanged), run cleaned up
       coordinator.getDecision("agent-a", "ch:1", "resp");
 
-      // Start a new run, channel moves, no pending left → suppress
+      // New run starts fresh, no leftover buffer
       coordinator.onAgentStart("agent-b", "ch:1");
       coordinator.onMessageReceived("ch:1");
       const decision = coordinator.getDecision("agent-b", "ch:1", "resp");
       expect(decision.action).toBe("suppress");
-    });
-
-    it("clears pending buffer after suppress", () => {
-      const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: true });
-
-      coordinator.onMessageReceived("ch:1");
-      coordinator.onAgentStart("agent-a", "ch:1");
-
-      // No pending, channel moves → suppress (clears buffer)
-      coordinator.onMessageReceived("ch:1");
-      coordinator.getDecision("agent-a", "ch:1", "resp");
-
-      // New run: add pending, confirm it was cleared from before
-      coordinator.onAgentStart("agent-b", "ch:1");
-      coordinator.onInboundClaim("ch:1", { content: "new-msg" });
-      coordinator.onMessageReceived("ch:1");
-
-      const decision = coordinator.getDecision("agent-b", "ch:1", "resp");
-      expect(decision.action).toBe("reinject");
-      if (decision.action === "reinject") {
-        expect(decision.context).toContain("new-msg");
-      }
     });
   });
 
@@ -740,9 +744,11 @@ describe("SpeedtrapCoordinator", () => {
       coordinator.onAgentStart("agent-a", "ch:1");
       coordinator.onInboundClaim("ch:1", { content: "hello" });
 
-      expect(logs.some((l) => l.includes("Claimed inbound") && l.includes("buffer size=1"))).toBe(
-        true,
-      );
+      expect(
+        logs.some(
+          (l) => l.includes("Claimed inbound") && l.includes("distributed to 1 active run"),
+        ),
+      ).toBe(true);
     });
 
     it("logs pending-followup reinject decisions", () => {

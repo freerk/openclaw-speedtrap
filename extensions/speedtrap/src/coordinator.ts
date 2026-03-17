@@ -5,29 +5,15 @@
  * per-agent-run metadata. Four possible outcomes:
  *
  *   deliver  — channel unchanged, response is fresh
- *   suppress — channel moved, no writes, no pending follow-ups → discard
- *   reinject — channel moved + writes, or channel moved + pending follow-ups
- *              → re-run so agent can revise its response
- *   deliver  — budget exhausted after reinject attempts → fail-safe
+ *   suppress — channel moved, no writes, no pending follow-ups
+ *   reinject — channel moved + writes, or channel moved + pending
+ *   deliver  — budget exhausted after reinject attempts (fail-safe)
  *
- * v2 adds coalescing:
- *   - inbound_claim: while a run is active for (agentId, channelKey),
- *     overlapping inbound messages are claimed and buffered.
- *   - Pending buffer is bounded (maxBufferedMessages) with TTL pruning.
- *   - Decision rules use pending buffer to decide reinject vs suppress
- *     when the channel moved but no writes occurred.
- *
- * Keying strategy:
- *   - Channel state keyed by the normalized physical channelKey
- *     (e.g. "slack:channel:C0AJD0XBMUJ"), built from channelId +
- *     conversationId (skipping accountId so multi-agent setups on
- *     different bot accounts see the same physical channel).
- *   - Agent runs keyed by agentId::channelKey (an agent processes
- *     one channel at a time, but we need channel scope for the
- *     message counter comparison).
- *   - Staleness detection uses a monotonic message counter per channel,
- *     not wall-clock timestamps. This avoids races where the agent's
- *     own triggering message could register as "channel moved".
+ * Pending buffers are per-agent-run, not per-channel:
+ *   When a message is claimed, it is appended to every active run on
+ *   that channel. Each agent accumulates its own view of what happened
+ *   while it was thinking. When an agent gets reinjected, its buffer
+ *   is consumed (cleared). Other agents keep their own buffers intact.
  *
  * State lives on globalThis via Symbol.for():
  *   The plugin is loaded through jiti, which creates a fresh module
@@ -96,40 +82,39 @@ export class SpeedtrapCoordinator {
   }
 
   // ---------------------------------------------------------------------------
-  // inbound_claim: claim overlapping inbound while a run is active
+  // inbound_claim: buffer into ALL active runs on this channel
   // ---------------------------------------------------------------------------
 
   /**
    * Returns true if the message was claimed (buffered), false if not claimed.
-   * Only claims when coalescing + claimWhileActive are enabled and ANY active
-   * run exists on this channel. The inbound_claim hook fires before agent
-   * selection, so there is no agentId available.
+   * When claimed, the message is appended to every active run on the channel
+   * so each agent gets its own view of what happened while it was processing.
    */
   onInboundClaim(channelKey: string, message: PendingInbound): boolean {
     if (!this.config.coalesce || !this.config.claimWhileActive) {
       return false;
     }
 
-    // Check if any active run exists on this channel.
-    const hasActiveRun = this.hasActiveRunOnChannel(channelKey);
-    if (!hasActiveRun) {
+    const activeRuns = this.getActiveRunsOnChannel(channelKey);
+    if (activeRuns.length === 0) {
       return false;
     }
 
-    const channel = this.ensureChannel(channelKey);
-    this.pruneExpiredPending(channel);
-
-    // Ring buffer: drop oldest if at capacity
-    if (channel.pending.length >= this.config.maxBufferedMessages) {
-      channel.pending.shift();
-    }
-
-    channel.pending.push({
+    const entry: PendingInbound = {
       ...message,
       ts: message.ts ?? Date.now(),
-    });
+    };
 
-    this.log(`Claimed inbound on ${channelKey}, buffer size=${channel.pending.length}`);
+    for (const run of activeRuns) {
+      this.pruneExpiredPending(run);
+      // Ring buffer: drop oldest if at capacity
+      if (run.pending.length >= this.config.maxBufferedMessages) {
+        run.pending.shift();
+      }
+      run.pending.push(entry);
+    }
+
+    this.log(`Claimed inbound on ${channelKey}, distributed to ${activeRuns.length} active run(s)`);
     return true;
   }
 
@@ -150,6 +135,7 @@ export class SpeedtrapCoordinator {
       writeToolNames: [],
       reinjectCount: 0,
       active: true,
+      pending: [],
     });
 
     this.log(`Agent ${agentId} started on ${channelKey}, snapshot count=${snapshotMessageCount}`);
@@ -185,10 +171,10 @@ export class SpeedtrapCoordinator {
 
     const preview = truncate(draftResponse, 200);
 
-    // No tracked run — let it through (conservative)
+    // No tracked run: let it through (conservative)
     if (!run) {
       this.log(
-        `Agent ${agentId} completed on ${channelKey}: no tracked run → delivering\n  response: ${preview}`,
+        `Agent ${agentId} completed on ${channelKey}: no tracked run, delivering\n  response: ${preview}`,
       );
       return { action: "deliver" };
     }
@@ -196,18 +182,18 @@ export class SpeedtrapCoordinator {
     const currentCount = channel?.messageCount ?? 0;
     const channelMoved = currentCount > run.snapshotMessageCount;
 
-    // A) Channel unchanged → deliver
+    // A) Channel unchanged: deliver
     if (!channelMoved) {
-      this.cleanupRun(runKey, channelKey);
+      agentRuns.delete(runKey);
       this.log(
-        `Agent ${agentId} completed on ${channelKey}: channel unchanged → delivering\n  response: ${preview}`,
+        `Agent ${agentId} completed on ${channelKey}: channel unchanged, delivering\n  response: ${preview}`,
       );
       return { action: "deliver" };
     }
 
-    // D) Budget exhausted → deliver (fail-safe)
+    // D) Budget exhausted: deliver (fail-safe)
     if (run.reinjectCount >= this.config.maxReinjects) {
-      this.cleanupRun(runKey, channelKey);
+      agentRuns.delete(runKey);
       this.log(
         `Agent ${agentId} on ${channelKey}: reinject budget exhausted (${run.reinjectCount}), delivering\n  response: ${preview}`,
       );
@@ -215,22 +201,19 @@ export class SpeedtrapCoordinator {
     }
 
     // Prune expired pending entries before checking
-    if (channel && this.config.coalesce) {
-      this.pruneExpiredPending(channel);
+    if (this.config.coalesce) {
+      this.pruneExpiredPending(run);
     }
 
-    // Snapshot and consume pending buffer: the first agent to reinject
-    // gets the buffered messages, subsequent agents see an empty buffer.
-    const pendingMessages = channel?.pending ? [...channel.pending] : [];
-    if (channel && pendingMessages.length > 0) {
-      channel.pending = [];
-    }
+    // Snapshot and consume this agent's pending buffer
+    const pendingMessages = run.pending.length > 0 ? [...run.pending] : [];
+    run.pending = [];
 
-    // B) Channel moved + writes → reinject (mandatory)
+    // B) Channel moved + writes: reinject (mandatory)
     if (run.hasWriteSideEffects) {
       run.reinjectCount++;
       this.log(
-        `Agent ${agentId} on ${channelKey}: channel moved, has writes → reinjecting (${run.reinjectCount}/${this.config.maxReinjects})\n  response: ${preview}`,
+        `Agent ${agentId} on ${channelKey}: channel moved, has writes, reinjecting (${run.reinjectCount}/${this.config.maxReinjects})\n  response: ${preview}`,
       );
       const context = this.config.coalesce
         ? buildCoalescedReinjectionPrompt(draftResponse, run.writeToolNames, pendingMessages)
@@ -238,21 +221,20 @@ export class SpeedtrapCoordinator {
       return { action: "reinject", context };
     }
 
-    // C) Channel moved + no writes
+    // C) Channel moved + no writes + has pending: reinject with context
     if (this.config.coalesce && pendingMessages.length > 0) {
-      // Has buffered follow-ups → reinject
       run.reinjectCount++;
       this.log(
-        `Agent ${agentId} on ${channelKey}: channel moved, no writes, ${pendingMessages.length} pending → reinjecting (${run.reinjectCount}/${this.config.maxReinjects})\n  response: ${preview}`,
+        `Agent ${agentId} on ${channelKey}: channel moved, no writes, ${pendingMessages.length} pending, reinjecting (${run.reinjectCount}/${this.config.maxReinjects})\n  response: ${preview}`,
       );
       const context = buildCoalescedReinjectionPrompt(draftResponse, [], pendingMessages);
       return { action: "reinject", context };
     }
 
-    // No writes + no pending (or coalesce disabled) → suppress
-    this.cleanupRun(runKey, channelKey);
+    // E) Channel moved + no writes + no pending: suppress
+    agentRuns.delete(runKey);
     this.log(
-      `Agent ${agentId} completed on ${channelKey}: channel moved, no writes → discarding\n  response: ${preview}`,
+      `Agent ${agentId} completed on ${channelKey}: channel moved, no writes, suppressing\n  response: ${preview}`,
     );
     return { action: "suppress" };
   }
@@ -285,36 +267,28 @@ export class SpeedtrapCoordinator {
     return `${agentId}::${channelKey}`;
   }
 
-  private hasActiveRunOnChannel(channelKey: string): boolean {
+  private getActiveRunsOnChannel(channelKey: string): AgentRunState[] {
+    const active: AgentRunState[] = [];
     for (const run of agentRuns.values()) {
       if (run.channelKey === channelKey && run.active) {
-        return true;
+        active.push(run);
       }
     }
-    return false;
+    return active;
   }
 
   private ensureChannel(channelKey: string): ChannelState {
     let channel = channels.get(channelKey);
     if (!channel) {
-      channel = { channelKey, messageCount: 0, pending: [] };
+      channel = { channelKey, messageCount: 0 };
       channels.set(channelKey, channel);
     }
     return channel;
   }
 
-  private cleanupRun(runKey: string, channelKey: string): void {
-    agentRuns.delete(runKey);
-    // Clear pending buffer on terminal decision
-    const channel = channels.get(channelKey);
-    if (channel) {
-      channel.pending = [];
-    }
-  }
-
-  private pruneExpiredPending(channel: ChannelState): void {
+  private pruneExpiredPending(run: AgentRunState): void {
     const cutoff = Date.now() - this.config.pendingTtlMs;
-    channel.pending = channel.pending.filter((p) => (p.ts ?? 0) >= cutoff);
+    run.pending = run.pending.filter((p) => (p.ts ?? 0) >= cutoff);
   }
 }
 
