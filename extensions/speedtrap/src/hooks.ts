@@ -1,7 +1,7 @@
 /**
  * Speedtrap hook bindings.
  *
- * Wires the five lifecycle hooks to the shared coordinator.
+ * Wires the six lifecycle hooks to the shared coordinator.
  * All hooks build the channel key from channelId + conversationId
  * (available in hook context), skipping accountId.
  */
@@ -26,6 +26,10 @@ export function registerSpeedtrapHooks(api: OpenClawPluginApi): void {
       pluginCfg.assumeUnknownToolsAreWrites ?? DEFAULT_CONFIG.assumeUnknownToolsAreWrites,
     debug: pluginCfg.debug ?? DEFAULT_CONFIG.debug,
     maxReinjects: pluginCfg.maxReinjects ?? DEFAULT_CONFIG.maxReinjects,
+    coalesce: pluginCfg.coalesce ?? DEFAULT_CONFIG.coalesce,
+    claimWhileActive: pluginCfg.claimWhileActive ?? DEFAULT_CONFIG.claimWhileActive,
+    maxBufferedMessages: pluginCfg.maxBufferedMessages ?? DEFAULT_CONFIG.maxBufferedMessages,
+    pendingTtlMs: pluginCfg.pendingTtlMs ?? DEFAULT_CONFIG.pendingTtlMs,
   };
 
   const log = (msg: string) => {
@@ -39,6 +43,22 @@ export function registerSpeedtrapHooks(api: OpenClawPluginApi): void {
   api.on("message_received", async (_event, ctx) => {
     const channelKey = buildPhysicalChannelKey(ctx.channelId, ctx.conversationId);
     coordinator.onMessageReceived(channelKey);
+  });
+
+  api.on("inbound_claim", async (event, ctx) => {
+    if (!ctx.channelId) return;
+    const channelKey = buildPhysicalChannelKey(ctx.channelId, ctx.conversationId);
+    // inbound_claim fires before agent selection, so there's no agentId.
+    // Check if ANY active run exists on this channel.
+    const claimed = coordinator.onInboundClaim(channelKey, {
+      content: event.content ?? "",
+      sender: event.senderName ?? event.senderId,
+      messageId: event.messageId,
+      ts: event.timestamp,
+    });
+    if (claimed) {
+      return { handled: true };
+    }
   });
 
   api.on("before_agent_start", async (_event, ctx) => {

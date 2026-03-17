@@ -2,12 +2,20 @@
  * Speedtrap Coordinator
  *
  * Minimal state manager: tracks per-channel message counters and
- * per-agent-run metadata. Three possible outcomes:
+ * per-agent-run metadata. Four possible outcomes:
  *
  *   deliver  — channel unchanged, response is fresh
- *   suppress — channel moved, no writes, response is stale → discard
- *   reinject — channel moved, has writes → re-run so agent can revise
- *              its response while confirming what it did
+ *   suppress — channel moved, no writes, no pending follow-ups → discard
+ *   reinject — channel moved + writes, or channel moved + pending follow-ups
+ *              → re-run so agent can revise its response
+ *   deliver  — budget exhausted after reinject attempts → fail-safe
+ *
+ * v2 adds coalescing:
+ *   - inbound_claim: while a run is active for (agentId, channelKey),
+ *     overlapping inbound messages are claimed and buffered.
+ *   - Pending buffer is bounded (maxBufferedMessages) with TTL pruning.
+ *   - Decision rules use pending buffer to decide reinject vs suppress
+ *     when the channel moved but no writes occurred.
  *
  * Keying strategy:
  *   - Channel state keyed by the normalized physical channelKey
@@ -32,7 +40,13 @@
  */
 
 import { isWriteTool } from "./classifier.js";
-import type { AgentRunState, ChannelState, SpeedtrapDecision, SpeedtrapConfig } from "./types.js";
+import type {
+  AgentRunState,
+  ChannelState,
+  PendingInbound,
+  SpeedtrapConfig,
+  SpeedtrapDecision,
+} from "./types.js";
 
 type SpeedtrapGlobalState = {
   channels: Map<string, ChannelState>;
@@ -76,13 +90,47 @@ export class SpeedtrapCoordinator {
   // ---------------------------------------------------------------------------
 
   onMessageReceived(channelKey: string): void {
-    let channel = channels.get(channelKey);
-    if (!channel) {
-      channel = { channelKey, messageCount: 0 };
-      channels.set(channelKey, channel);
-    }
+    const channel = this.ensureChannel(channelKey);
     channel.messageCount++;
     this.log(`Channel ${channelKey}: message received, count=${channel.messageCount}`);
+  }
+
+  // ---------------------------------------------------------------------------
+  // inbound_claim: claim overlapping inbound while a run is active
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Returns true if the message was claimed (buffered), false if not claimed.
+   * Only claims when coalescing + claimWhileActive are enabled and ANY active
+   * run exists on this channel. The inbound_claim hook fires before agent
+   * selection, so there is no agentId available.
+   */
+  onInboundClaim(channelKey: string, message: PendingInbound): boolean {
+    if (!this.config.coalesce || !this.config.claimWhileActive) {
+      return false;
+    }
+
+    // Check if any active run exists on this channel.
+    const hasActiveRun = this.hasActiveRunOnChannel(channelKey);
+    if (!hasActiveRun) {
+      return false;
+    }
+
+    const channel = this.ensureChannel(channelKey);
+    this.pruneExpiredPending(channel);
+
+    // Ring buffer: drop oldest if at capacity
+    if (channel.pending.length >= this.config.maxBufferedMessages) {
+      channel.pending.shift();
+    }
+
+    channel.pending.push({
+      ...message,
+      ts: message.ts ?? Date.now(),
+    });
+
+    this.log(`Claimed inbound on ${channelKey}, buffer size=${channel.pending.length}`);
+    return true;
   }
 
   // ---------------------------------------------------------------------------
@@ -90,8 +138,8 @@ export class SpeedtrapCoordinator {
   // ---------------------------------------------------------------------------
 
   onAgentStart(agentId: string, channelKey: string): void {
-    const channel = channels.get(channelKey);
-    const snapshotMessageCount = channel?.messageCount ?? 0;
+    const channel = this.ensureChannel(channelKey);
+    const snapshotMessageCount = channel.messageCount;
 
     const runKey = this.runKey(agentId, channelKey);
     agentRuns.set(runKey, {
@@ -101,6 +149,7 @@ export class SpeedtrapCoordinator {
       hasWriteSideEffects: false,
       writeToolNames: [],
       reinjectCount: 0,
+      active: true,
     });
 
     this.log(`Agent ${agentId} started on ${channelKey}, snapshot count=${snapshotMessageCount}`);
@@ -147,32 +196,56 @@ export class SpeedtrapCoordinator {
     const currentCount = channel?.messageCount ?? 0;
     const channelMoved = currentCount > run.snapshotMessageCount;
 
+    // A) Channel unchanged → deliver
     if (!channelMoved) {
-      agentRuns.delete(runKey);
+      this.cleanupRun(runKey, channelKey);
       this.log(
         `Agent ${agentId} completed on ${channelKey}: channel unchanged → delivering\n  response: ${preview}`,
       );
       return { action: "deliver" };
     }
 
+    // D) Budget exhausted → deliver (fail-safe)
+    if (run.reinjectCount >= this.config.maxReinjects) {
+      this.cleanupRun(runKey, channelKey);
+      this.log(
+        `Agent ${agentId} on ${channelKey}: reinject budget exhausted (${run.reinjectCount}), delivering\n  response: ${preview}`,
+      );
+      return { action: "deliver" };
+    }
+
+    // Prune expired pending entries before checking
+    if (channel && this.config.coalesce) {
+      this.pruneExpiredPending(channel);
+    }
+
+    const pendingMessages = channel?.pending ?? [];
+
+    // B) Channel moved + writes → reinject (mandatory)
     if (run.hasWriteSideEffects) {
-      if (run.reinjectCount >= this.config.maxReinjects) {
-        agentRuns.delete(runKey);
-        this.log(
-          `Agent ${agentId} on ${channelKey}: reinject budget exhausted (${run.reinjectCount}), delivering\n  response: ${preview}`,
-        );
-        return { action: "deliver" };
-      }
-      // Keep the run state — we'll see it again after core re-runs the agent
       run.reinjectCount++;
       this.log(
         `Agent ${agentId} on ${channelKey}: channel moved, has writes → reinjecting (${run.reinjectCount}/${this.config.maxReinjects})\n  response: ${preview}`,
       );
-      const context = buildWriteReinjectionPrompt(draftResponse, run.writeToolNames);
+      const context = this.config.coalesce
+        ? buildCoalescedReinjectionPrompt(draftResponse, run.writeToolNames, pendingMessages)
+        : buildWriteReinjectionPrompt(draftResponse, run.writeToolNames);
       return { action: "reinject", context };
     }
 
-    agentRuns.delete(runKey);
+    // C) Channel moved + no writes
+    if (this.config.coalesce && pendingMessages.length > 0) {
+      // Has buffered follow-ups → reinject
+      run.reinjectCount++;
+      this.log(
+        `Agent ${agentId} on ${channelKey}: channel moved, no writes, ${pendingMessages.length} pending → reinjecting (${run.reinjectCount}/${this.config.maxReinjects})\n  response: ${preview}`,
+      );
+      const context = buildCoalescedReinjectionPrompt(draftResponse, [], pendingMessages);
+      return { action: "reinject", context };
+    }
+
+    // No writes + no pending (or coalesce disabled) → suppress
+    this.cleanupRun(runKey, channelKey);
     this.log(
       `Agent ${agentId} completed on ${channelKey}: channel moved, no writes → discarding\n  response: ${preview}`,
     );
@@ -206,10 +279,42 @@ export class SpeedtrapCoordinator {
   private runKey(agentId: string, channelKey: string): string {
     return `${agentId}::${channelKey}`;
   }
+
+  private hasActiveRunOnChannel(channelKey: string): boolean {
+    for (const run of agentRuns.values()) {
+      if (run.channelKey === channelKey && run.active) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private ensureChannel(channelKey: string): ChannelState {
+    let channel = channels.get(channelKey);
+    if (!channel) {
+      channel = { channelKey, messageCount: 0, pending: [] };
+      channels.set(channelKey, channel);
+    }
+    return channel;
+  }
+
+  private cleanupRun(runKey: string, channelKey: string): void {
+    agentRuns.delete(runKey);
+    // Clear pending buffer on terminal decision
+    const channel = channels.get(channelKey);
+    if (channel) {
+      channel.pending = [];
+    }
+  }
+
+  private pruneExpiredPending(channel: ChannelState): void {
+    const cutoff = Date.now() - this.config.pendingTtlMs;
+    channel.pending = channel.pending.filter((p) => (p.ts ?? 0) >= cutoff);
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Reinjection prompt for write-side-effect runs
+// Reinjection prompt for write-side-effect runs (v1 compat, coalesce=false)
 // ---------------------------------------------------------------------------
 
 function buildWriteReinjectionPrompt(draftResponse: string, writeToolNames: string[]): string {
@@ -228,6 +333,52 @@ function buildWriteReinjectionPrompt(draftResponse: string, writeToolNames: stri
     "but adapt your message to the current conversation state.",
     "Do not mention this notice in your response.",
   ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Coalesced reinjection prompt (v2, coalesce=true)
+// ---------------------------------------------------------------------------
+
+function buildCoalescedReinjectionPrompt(
+  draftResponse: string,
+  writeToolNames: string[],
+  pendingMessages: PendingInbound[],
+): string {
+  const lines: string[] = [
+    "[SPEEDTRAP: CHANNEL MOVED DURING YOUR RUN]",
+    "",
+    "New messages appeared on the channel while you were working.",
+  ];
+
+  if (pendingMessages.length > 0) {
+    lines.push("");
+    lines.push("Buffered follow-up messages (oldest to newest):");
+    for (const msg of pendingMessages) {
+      const prefix = msg.sender ? `[${msg.sender}] ` : "";
+      lines.push(`  - ${prefix}${msg.content}`);
+    }
+  }
+
+  if (writeToolNames.length > 0) {
+    const toolList = [...new Set(writeToolNames)].join(", ");
+    lines.push("");
+    lines.push(
+      `You executed write operations (${toolList}) — those side effects already happened.`,
+    );
+  }
+
+  lines.push("");
+  lines.push("Your drafted response:");
+  lines.push(draftResponse);
+  lines.push("");
+  lines.push("Revise your response to account for the new channel activity.");
+  if (writeToolNames.length > 0) {
+    lines.push("You must still confirm what you did (the writes already happened),");
+    lines.push("but adapt your message to the current conversation state.");
+  }
+  lines.push("Do not mention this notice in your response.");
+
+  return lines.join("\n");
 }
 
 function truncate(text: string, maxLen: number): string {

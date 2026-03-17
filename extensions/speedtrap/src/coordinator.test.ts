@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SpeedtrapCoordinator, resetSharedState } from "./coordinator.js";
 import type { SpeedtrapConfig } from "./types.js";
 
@@ -11,6 +11,10 @@ function createCoordinator(overrides: Partial<SpeedtrapConfig> = {}): {
     assumeUnknownToolsAreWrites: true,
     debug: true,
     maxReinjects: 3,
+    coalesce: false,
+    claimWhileActive: false,
+    maxBufferedMessages: 20,
+    pendingTtlMs: 900_000,
     ...overrides,
   };
   const coordinator = new SpeedtrapCoordinator(config, (msg) => logs.push(msg));
@@ -22,14 +26,16 @@ describe("SpeedtrapCoordinator", () => {
     resetSharedState();
   });
 
+  // ===========================================================================
+  // v1 behavior (coalesce=false, default)
+  // ===========================================================================
+
   describe("channel unchanged → deliver", () => {
     it("delivers when no new messages arrived after agent start", () => {
       const { coordinator } = createCoordinator();
 
-      // Message arrives, agent starts, no new messages
       coordinator.onMessageReceived("ch:1");
       coordinator.onAgentStart("agent-a", "ch:1");
-      // No new message_received after agent start
       const decision = coordinator.getDecision("agent-a", "ch:1", "my response");
 
       expect(decision.action).toBe("deliver");
@@ -38,7 +44,6 @@ describe("SpeedtrapCoordinator", () => {
     it("delivers when agent starts before any messages on channel", () => {
       const { coordinator } = createCoordinator();
 
-      // Agent starts on a channel with no history
       coordinator.onAgentStart("agent-a", "ch:1");
       const decision = coordinator.getDecision("agent-a", "ch:1", "my response");
 
@@ -51,7 +56,6 @@ describe("SpeedtrapCoordinator", () => {
       const { coordinator } = createCoordinator();
 
       coordinator.onAgentStart("agent-a", "ch:1");
-      // Message arrives after agent started
       coordinator.onMessageReceived("ch:1");
       const decision = coordinator.getDecision("agent-a", "ch:1", "my response");
 
@@ -65,7 +69,6 @@ describe("SpeedtrapCoordinator", () => {
       coordinator.onToolCall("agent-a", "ch:1", "memory_search");
       coordinator.onToolCall("agent-a", "ch:1", "web_search");
       coordinator.onToolCall("agent-a", "ch:1", "file_read");
-      // Channel moves after agent started
       coordinator.onMessageReceived("ch:1");
       const decision = coordinator.getDecision("agent-a", "ch:1", "my response");
 
@@ -147,24 +150,17 @@ describe("SpeedtrapCoordinator", () => {
     it("fastest agent delivers, slower agents get discarded", () => {
       const { coordinator } = createCoordinator();
 
-      // Triggering message arrives
       coordinator.onMessageReceived("ch:1");
 
-      // All 3 agents start processing (snapshot same count)
       coordinator.onAgentStart("agent-a", "ch:1");
       coordinator.onAgentStart("agent-b", "ch:1");
       coordinator.onAgentStart("agent-c", "ch:1");
 
-      // Agent A finishes first — no new messages on channel
       expect(coordinator.getDecision("agent-a", "ch:1", "resp-a").action).toBe("deliver");
 
-      // Agent A's response appears as a new message on the channel
       coordinator.onMessageReceived("ch:1");
 
-      // Agent B finishes — channel moved
       expect(coordinator.getDecision("agent-b", "ch:1", "resp-b").action).toBe("suppress");
-
-      // Agent C finishes — channel still moved
       expect(coordinator.getDecision("agent-c", "ch:1", "resp-c").action).toBe("suppress");
     });
   });
@@ -173,23 +169,17 @@ describe("SpeedtrapCoordinator", () => {
     it("cascade-triggered runs get discarded as channel keeps moving", () => {
       const { coordinator } = createCoordinator();
 
-      // Initial message
       coordinator.onMessageReceived("ch:1");
 
-      // Agent A starts
       coordinator.onAgentStart("agent-a", "ch:1");
 
-      // Agent A finishes + delivers (no channel movement since snapshot)
       expect(coordinator.getDecision("agent-a", "ch:1", "resp").action).toBe("deliver");
 
-      // Agent A's response triggers agent B (cascade) — new message on channel
       coordinator.onMessageReceived("ch:1");
       coordinator.onAgentStart("agent-b", "ch:1");
 
-      // Another message appears
       coordinator.onMessageReceived("ch:1");
 
-      // Agent B finishes — channel moved since its snapshot
       expect(coordinator.getDecision("agent-b", "ch:1", "resp").action).toBe("suppress");
     });
   });
@@ -213,7 +203,6 @@ describe("SpeedtrapCoordinator", () => {
       coordinator.onAgentStart("agent-a", "ch:1");
       coordinator.onAgentStart("agent-b", "ch:2");
 
-      // Only ch:1 gets a new message
       coordinator.onMessageReceived("ch:1");
 
       expect(coordinator.getDecision("agent-a", "ch:1", "resp").action).toBe("suppress");
@@ -231,7 +220,6 @@ describe("SpeedtrapCoordinator", () => {
       coordinator.onAgentStart("agent-a", "ch:1");
       coordinator.onAgentStart("agent-a", "ch:2");
 
-      // Only ch:1 moves
       coordinator.onMessageReceived("ch:1");
 
       expect(coordinator.getDecision("agent-a", "ch:1", "resp").action).toBe("suppress");
@@ -246,10 +234,8 @@ describe("SpeedtrapCoordinator", () => {
       coordinator.onMessageReceived("ch:1");
       coordinator.onAgentStart("agent-a", "ch:1");
 
-      // First call cleans up
       coordinator.getDecision("agent-a", "ch:1", "resp");
 
-      // Second call has no state → conservative deliver
       expect(coordinator.getDecision("agent-a", "ch:1", "resp").action).toBe("deliver");
     });
   });
@@ -300,11 +286,9 @@ describe("SpeedtrapCoordinator", () => {
       coordinator.onToolCall("agent-a", "ch:1", "bash");
       coordinator.onMessageReceived("ch:1");
 
-      // First two calls reinject
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-1").action).toBe("reinject");
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-2").action).toBe("reinject");
 
-      // Third call: budget exhausted, forced delivery
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-3").action).toBe("deliver");
     });
 
@@ -318,7 +302,6 @@ describe("SpeedtrapCoordinator", () => {
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-1").action).toBe("reinject");
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-2").action).toBe("deliver");
 
-      // State cleaned up — falls back to conservative deliver
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-3").action).toBe("deliver");
     });
 
@@ -345,9 +328,7 @@ describe("SpeedtrapCoordinator", () => {
       coordinator.onToolCall("agent-a", "ch:1", "bash");
       coordinator.onMessageReceived("ch:1");
 
-      // Reinject keeps state
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-1").action).toBe("reinject");
-      // State still there for next decision
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-2").action).toBe("reinject");
     });
   });
@@ -356,13 +337,450 @@ describe("SpeedtrapCoordinator", () => {
     it("message before agent start does not count as channel moved", () => {
       const { coordinator } = createCoordinator();
 
-      // The triggering message arrives and the agent starts
-      // (message_received fires before before_agent_start)
       coordinator.onMessageReceived("ch:1");
       coordinator.onAgentStart("agent-a", "ch:1");
 
-      // Agent finishes — the triggering message was snapshotted, not "new"
       expect(coordinator.getDecision("agent-a", "ch:1", "resp").action).toBe("deliver");
+    });
+  });
+
+  // ===========================================================================
+  // v2 coalescing behavior (coalesce=true)
+  // ===========================================================================
+
+  describe("inbound_claim: claim gating", () => {
+    it("does not claim when coalesce is disabled", () => {
+      const { coordinator } = createCoordinator({ coalesce: false, claimWhileActive: true });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+
+      const claimed = coordinator.onInboundClaim("ch:1", { content: "follow-up" });
+      expect(claimed).toBe(false);
+    });
+
+    it("does not claim when claimWhileActive is disabled", () => {
+      const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: false });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+
+      const claimed = coordinator.onInboundClaim("ch:1", { content: "follow-up" });
+      expect(claimed).toBe(false);
+    });
+
+    it("does not claim when no active run exists", () => {
+      const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: true });
+
+      const claimed = coordinator.onInboundClaim("ch:1", { content: "follow-up" });
+      expect(claimed).toBe(false);
+    });
+
+    it("claims when active run exists for same agent+channel", () => {
+      const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: true });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+
+      const claimed = coordinator.onInboundClaim("ch:1", { content: "follow-up" });
+      expect(claimed).toBe(true);
+    });
+
+    it("claims for a different agent on the same channel (any active run)", () => {
+      const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: true });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+
+      const claimed = coordinator.onInboundClaim("ch:1", { content: "follow-up" });
+      expect(claimed).toBe(true);
+    });
+
+    it("does not claim on a different channel", () => {
+      const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: true });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+
+      const claimed = coordinator.onInboundClaim("ch:2", { content: "follow-up" });
+      expect(claimed).toBe(false);
+    });
+  });
+
+  describe("overlap merge: coalesced reinjection", () => {
+    it("reinjects with buffered follow-ups when channel moved and no writes", () => {
+      const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: true });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+
+      coordinator.onInboundClaim("ch:1", { content: "also do X" });
+      coordinator.onInboundClaim("ch:1", { content: "and Y" });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onMessageReceived("ch:1");
+
+      const decision = coordinator.getDecision("agent-a", "ch:1", "original draft");
+
+      expect(decision.action).toBe("reinject");
+      if (decision.action === "reinject") {
+        expect(decision.context).toContain("also do X");
+        expect(decision.context).toContain("and Y");
+        expect(decision.context).toContain("original draft");
+        expect(decision.context).toContain("Buffered follow-up messages");
+      }
+    });
+
+    it("includes sender in coalesced reinjection context", () => {
+      const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: true });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+
+      coordinator.onInboundClaim("ch:1", { content: "hello", sender: "alice" });
+      coordinator.onMessageReceived("ch:1");
+
+      const decision = coordinator.getDecision("agent-a", "ch:1", "draft");
+
+      expect(decision.action).toBe("reinject");
+      if (decision.action === "reinject") {
+        expect(decision.context).toContain("[alice]");
+      }
+    });
+
+    it("reinjects with both writes and pending follow-ups", () => {
+      const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: true });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+
+      coordinator.onToolCall("agent-a", "ch:1", "write_file");
+      coordinator.onInboundClaim("ch:1", { content: "wait also do Z" });
+      coordinator.onMessageReceived("ch:1");
+
+      const decision = coordinator.getDecision("agent-a", "ch:1", "I wrote config");
+
+      expect(decision.action).toBe("reinject");
+      if (decision.action === "reinject") {
+        expect(decision.context).toContain("write_file");
+        expect(decision.context).toContain("wait also do Z");
+        expect(decision.context).toContain("I wrote config");
+      }
+    });
+  });
+
+  describe("no-followup stale read-only → suppress (coalesce=true)", () => {
+    it("suppresses when channel moved, no writes, no pending", () => {
+      const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: true });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+      coordinator.onMessageReceived("ch:1");
+
+      const decision = coordinator.getDecision("agent-a", "ch:1", "stale response");
+      expect(decision.action).toBe("suppress");
+    });
+  });
+
+  describe("writes stale → reinject with write confirmation (coalesce=true)", () => {
+    it("reinjects with write tool list when channel moved and writes occurred", () => {
+      const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: true });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+      coordinator.onToolCall("agent-a", "ch:1", "bash");
+      coordinator.onToolCall("agent-a", "ch:1", "write_file");
+      coordinator.onMessageReceived("ch:1");
+
+      const decision = coordinator.getDecision("agent-a", "ch:1", "executed commands");
+
+      expect(decision.action).toBe("reinject");
+      if (decision.action === "reinject") {
+        expect(decision.context).toContain("bash, write_file");
+        expect(decision.context).toContain("write operations");
+        expect(decision.context).toContain("already happened");
+      }
+    });
+  });
+
+  describe("buffer bounds and TTL", () => {
+    it("enforces maxBufferedMessages as a ring buffer", () => {
+      const { coordinator } = createCoordinator({
+        coalesce: true,
+        claimWhileActive: true,
+        maxBufferedMessages: 3,
+      });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+
+      coordinator.onInboundClaim("ch:1", { content: "msg-1" });
+      coordinator.onInboundClaim("ch:1", { content: "msg-2" });
+      coordinator.onInboundClaim("ch:1", { content: "msg-3" });
+      coordinator.onInboundClaim("ch:1", { content: "msg-4" });
+
+      coordinator.onMessageReceived("ch:1");
+      const decision = coordinator.getDecision("agent-a", "ch:1", "draft");
+
+      expect(decision.action).toBe("reinject");
+      if (decision.action === "reinject") {
+        // msg-1 should have been dropped (oldest)
+        expect(decision.context).not.toContain("msg-1");
+        expect(decision.context).toContain("msg-2");
+        expect(decision.context).toContain("msg-3");
+        expect(decision.context).toContain("msg-4");
+      }
+    });
+
+    it("prunes expired pending entries by TTL", () => {
+      vi.useFakeTimers();
+      try {
+        const { coordinator } = createCoordinator({
+          coalesce: true,
+          claimWhileActive: true,
+          pendingTtlMs: 1000,
+        });
+
+        coordinator.onMessageReceived("ch:1");
+        coordinator.onAgentStart("agent-a", "ch:1");
+
+        coordinator.onInboundClaim("ch:1", { content: "old-msg", ts: Date.now() });
+
+        vi.advanceTimersByTime(1500);
+
+        coordinator.onInboundClaim("ch:1", { content: "fresh-msg", ts: Date.now() });
+
+        coordinator.onMessageReceived("ch:1");
+        const decision = coordinator.getDecision("agent-a", "ch:1", "draft");
+
+        expect(decision.action).toBe("reinject");
+        if (decision.action === "reinject") {
+          expect(decision.context).not.toContain("old-msg");
+          expect(decision.context).toContain("fresh-msg");
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("suppresses when all pending entries have expired", () => {
+      vi.useFakeTimers();
+      try {
+        const { coordinator } = createCoordinator({
+          coalesce: true,
+          claimWhileActive: true,
+          pendingTtlMs: 1000,
+        });
+
+        coordinator.onMessageReceived("ch:1");
+        coordinator.onAgentStart("agent-a", "ch:1");
+
+        coordinator.onInboundClaim("ch:1", { content: "old-msg", ts: Date.now() });
+
+        vi.advanceTimersByTime(1500);
+
+        coordinator.onMessageReceived("ch:1");
+        const decision = coordinator.getDecision("agent-a", "ch:1", "draft");
+
+        expect(decision.action).toBe("suppress");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe("budget exhaustion with coalescing", () => {
+    it("delivers after maxReinjects even with pending follow-ups", () => {
+      const { coordinator } = createCoordinator({
+        coalesce: true,
+        claimWhileActive: true,
+        maxReinjects: 1,
+      });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+
+      coordinator.onInboundClaim("ch:1", { content: "follow-up" });
+      coordinator.onMessageReceived("ch:1");
+
+      // First call: reinject (pending follow-ups, budget not exhausted)
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-1").action).toBe("reinject");
+
+      // Second call: budget exhausted, forced delivery
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-2").action).toBe("deliver");
+    });
+
+    it("delivers after maxReinjects with writes + coalescing", () => {
+      const { coordinator } = createCoordinator({
+        coalesce: true,
+        claimWhileActive: true,
+        maxReinjects: 2,
+      });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+      coordinator.onToolCall("agent-a", "ch:1", "bash");
+      coordinator.onMessageReceived("ch:1");
+
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-1").action).toBe("reinject");
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-2").action).toBe("reinject");
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-3").action).toBe("deliver");
+    });
+  });
+
+  describe("isolation with coalescing", () => {
+    it("pending buffer is per-channel, not per-agent", () => {
+      const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: true });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onMessageReceived("ch:2");
+
+      coordinator.onAgentStart("agent-a", "ch:1");
+      coordinator.onAgentStart("agent-a", "ch:2");
+
+      // Buffer a message on ch:1 only
+      coordinator.onInboundClaim("ch:1", { content: "ch1-follow" });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onMessageReceived("ch:2");
+
+      // ch:1 has pending → reinject
+      const d1 = coordinator.getDecision("agent-a", "ch:1", "resp");
+      expect(d1.action).toBe("reinject");
+
+      // ch:2 has no pending → suppress (no writes, coalesce on, no pending)
+      const d2 = coordinator.getDecision("agent-a", "ch:2", "resp");
+      expect(d2.action).toBe("suppress");
+    });
+
+    it("same agent on different channels has independent claim state", () => {
+      const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: true });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+
+      // Claim on ch:1 succeeds
+      expect(coordinator.onInboundClaim("ch:1", { content: "msg" })).toBe(true);
+
+      // Claim on ch:2 fails (no active run)
+      expect(coordinator.onInboundClaim("ch:2", { content: "msg" })).toBe(false);
+    });
+  });
+
+  describe("pending buffer cleanup after terminal decision", () => {
+    it("clears pending buffer after deliver", () => {
+      const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: true });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+      coordinator.onInboundClaim("ch:1", { content: "buffered" });
+
+      // Channel unchanged → deliver (pending buffer cleared)
+      coordinator.getDecision("agent-a", "ch:1", "resp");
+
+      // Start a new run, channel moves, no pending left → suppress
+      coordinator.onAgentStart("agent-b", "ch:1");
+      coordinator.onMessageReceived("ch:1");
+      const decision = coordinator.getDecision("agent-b", "ch:1", "resp");
+      expect(decision.action).toBe("suppress");
+    });
+
+    it("clears pending buffer after suppress", () => {
+      const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: true });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+
+      // No pending, channel moves → suppress (clears buffer)
+      coordinator.onMessageReceived("ch:1");
+      coordinator.getDecision("agent-a", "ch:1", "resp");
+
+      // New run: add pending, confirm it was cleared from before
+      coordinator.onAgentStart("agent-b", "ch:1");
+      coordinator.onInboundClaim("ch:1", { content: "new-msg" });
+      coordinator.onMessageReceived("ch:1");
+
+      const decision = coordinator.getDecision("agent-b", "ch:1", "resp");
+      expect(decision.action).toBe("reinject");
+      if (decision.action === "reinject") {
+        expect(decision.context).toContain("new-msg");
+      }
+    });
+  });
+
+  describe("coalesced herd scenario", () => {
+    it("fastest delivers, overlap gets single coalesced reinject for writes", () => {
+      const { coordinator } = createCoordinator({ coalesce: true, claimWhileActive: true });
+
+      coordinator.onMessageReceived("ch:1");
+
+      coordinator.onAgentStart("agent-a", "ch:1");
+      coordinator.onAgentStart("agent-b", "ch:1");
+
+      // Agent B does writes
+      coordinator.onToolCall("agent-b", "ch:1", "write_file");
+
+      // Agent A finishes first → deliver
+      expect(coordinator.getDecision("agent-a", "ch:1", "resp-a").action).toBe("deliver");
+
+      // Agent A's response is a new message
+      coordinator.onMessageReceived("ch:1");
+
+      // Agent B finishes: channel moved + writes → reinject
+      const decision = coordinator.getDecision("agent-b", "ch:1", "resp-b");
+      expect(decision.action).toBe("reinject");
+    });
+  });
+
+  describe("claim logging", () => {
+    it("logs claimed inbound messages", () => {
+      const { coordinator, logs } = createCoordinator({ coalesce: true, claimWhileActive: true });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+      coordinator.onInboundClaim("ch:1", { content: "hello" });
+
+      expect(logs.some((l) => l.includes("Claimed inbound") && l.includes("buffer size=1"))).toBe(
+        true,
+      );
+    });
+
+    it("logs pending-followup reinject decisions", () => {
+      const { coordinator, logs } = createCoordinator({ coalesce: true, claimWhileActive: true });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+      coordinator.onInboundClaim("ch:1", { content: "msg" });
+      coordinator.onMessageReceived("ch:1");
+      coordinator.getDecision("agent-a", "ch:1", "draft");
+
+      expect(
+        logs.some(
+          (l) => l.includes("no writes") && l.includes("1 pending") && l.includes("reinjecting"),
+        ),
+      ).toBe(true);
+    });
+  });
+
+  describe("backward compatibility: coalesce=false preserves v1 behavior", () => {
+    it("never claims inbound when coalesce=false", () => {
+      const { coordinator } = createCoordinator({ coalesce: false });
+
+      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
+
+      expect(coordinator.onInboundClaim("ch:1", { content: "msg" })).toBe(false);
+    });
+
+    it("suppresses stale no-write responses regardless of pending", () => {
+      const { coordinator } = createCoordinator({ coalesce: false });
+
+      coordinator.onAgentStart("agent-a", "ch:1");
+      coordinator.onMessageReceived("ch:1");
+
+      // Even if pending existed somehow (it won't via claim, but testing the path)
+      const decision = coordinator.getDecision("agent-a", "ch:1", "stale");
+      expect(decision.action).toBe("suppress");
     });
   });
 });
