@@ -49,16 +49,7 @@ export interface PendingInbound {
 }
 
 /**
- * Per-channel state: monotonic counter of messages received.
- */
-export interface ChannelState {
-  channelKey: string;
-  messageCount: number;
-}
-
-/**
- * Per-agent-run state: snapshot of channel message count at start,
- * write tracking, and per-agent pending buffer.
+ * Per-agent-run state: write tracking and per-agent pending buffer.
  *
  * Each agent accumulates messages that arrived while IT was processing.
  * When agent A delivers, its response is buffered into all OTHER active
@@ -69,8 +60,8 @@ export interface ChannelState {
 export interface AgentRunState {
   agentId: string;
   channelKey: string;
-  /** Channel message count when the agent started processing. */
-  snapshotMessageCount: number;
+  /** True if any message arrived on the channel after this run started. */
+  channelDirty: boolean;
   hasWriteSideEffects: boolean;
   /** Names of write tools invoked during this run (for reinjection context). */
   writeToolNames: string[];

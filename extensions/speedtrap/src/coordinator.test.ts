@@ -267,14 +267,13 @@ describe("SpeedtrapCoordinator", () => {
       );
     });
 
-    it("logs message count on receive", () => {
+    it("logs dirty marking on receive", () => {
       const { coordinator, logs } = createCoordinator();
 
-      coordinator.onMessageReceived("ch:1");
+      coordinator.onAgentStart("agent-a", "ch:1");
       coordinator.onMessageReceived("ch:1");
 
-      expect(logs.some((l) => l.includes("count=1"))).toBe(true);
-      expect(logs.some((l) => l.includes("count=2"))).toBe(true);
+      expect(logs.some((l) => l.includes("marked 1 active run(s) dirty"))).toBe(true);
     });
   });
 
@@ -287,8 +286,11 @@ describe("SpeedtrapCoordinator", () => {
       coordinator.onMessageReceived("ch:1");
 
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-1").action).toBe("reinject");
+      // Re-dirty: reinject resets the flag, so the channel must move again
+      coordinator.onMessageReceived("ch:1");
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-2").action).toBe("reinject");
 
+      coordinator.onMessageReceived("ch:1");
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-3").action).toBe("deliver");
     });
 
@@ -300,8 +302,10 @@ describe("SpeedtrapCoordinator", () => {
       coordinator.onMessageReceived("ch:1");
 
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-1").action).toBe("reinject");
+      coordinator.onMessageReceived("ch:1");
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-2").action).toBe("deliver");
 
+      // Run was cleaned up, so "no tracked run" -> deliver
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-3").action).toBe("deliver");
     });
 
@@ -329,6 +333,7 @@ describe("SpeedtrapCoordinator", () => {
       coordinator.onMessageReceived("ch:1");
 
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-1").action).toBe("reinject");
+      coordinator.onMessageReceived("ch:1");
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-2").action).toBe("reinject");
     });
   });
@@ -617,13 +622,14 @@ describe("SpeedtrapCoordinator", () => {
         maxReinjects: 2,
       });
 
-      coordinator.onMessageReceived("ch:1");
       coordinator.onAgentStart("agent-a", "ch:1");
       coordinator.onToolCall("agent-a", "ch:1", "bash");
       coordinator.onMessageReceived("ch:1");
 
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-1").action).toBe("reinject");
+      coordinator.onMessageReceived("ch:1");
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-2").action).toBe("reinject");
+      coordinator.onMessageReceived("ch:1");
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-3").action).toBe("deliver");
     });
   });
@@ -682,9 +688,9 @@ describe("SpeedtrapCoordinator", () => {
       // Agent A reinjects and consumes its buffer
       expect(coordinator.getDecision("agent-a", "ch:1", "draft-a").action).toBe("reinject");
 
-      // Agent A's buffer is now empty, second call with no new pending
-      // Channel still moved (count > snapshot), no writes, empty buffer → suppress
-      expect(coordinator.getDecision("agent-a", "ch:1", "draft-a2").action).toBe("suppress");
+      // Agent A's dirty flag was reset by reinject. No new messages arrived,
+      // so the re-run's response is fresh and should deliver.
+      expect(coordinator.getDecision("agent-a", "ch:1", "draft-a2").action).toBe("deliver");
 
       // Agent B still has msg-1 in its own buffer
       const dB = coordinator.getDecision("agent-b", "ch:1", "draft-b");

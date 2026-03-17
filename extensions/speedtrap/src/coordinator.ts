@@ -1,15 +1,19 @@
 /**
  * Speedtrap Coordinator
  *
- * Minimal state manager: tracks per-channel message counters and
- * per-agent-run metadata. Four possible outcomes:
+ * Per-agent-run state manager. Four possible outcomes:
  *
  *   deliver  — channel unchanged, response is fresh
- *   suppress — channel moved, no writes, no pending follow-ups
+ *   suppress — channel moved, no writes, no pending
  *   reinject — channel moved + writes, or channel moved + pending
  *   deliver  — budget exhausted after reinject attempts (fail-safe)
  *
- * Pending buffers are per-agent-run, not per-channel:
+ * "Channel moved" is a boolean flag per run, not a counter comparison.
+ * When any message arrives on a channel (message_received), all active
+ * runs on that channel are marked dirty. The decision logic checks the
+ * flag, not a counter delta.
+ *
+ * Pending buffers are per-agent-run:
  *   When a message is claimed, it is appended to every active run on
  *   that channel. Each agent accumulates its own view of what happened
  *   while it was thinking. When an agent gets reinjected, its buffer
@@ -17,25 +21,15 @@
  *
  * State lives on globalThis via Symbol.for():
  *   The plugin is loaded through jiti, which creates a fresh module
- *   instance per loadOpenClawPlugins() call (each call builds a new
- *   jiti loader). Module-level variables would be separate per instance,
- *   breaking cross-subsystem state sharing. Using globalThis with a
- *   well-known Symbol key ensures all instances in the same process
- *   share the same Maps, regardless of how many times the module is
- *   imported.
+ *   instance per loadOpenClawPlugins() call. Module-level variables
+ *   would be separate per instance. Using globalThis with a well-known
+ *   Symbol key ensures all instances share the same Map.
  */
 
 import { isWriteTool } from "./classifier.js";
-import type {
-  AgentRunState,
-  ChannelState,
-  PendingInbound,
-  SpeedtrapConfig,
-  SpeedtrapDecision,
-} from "./types.js";
+import type { AgentRunState, PendingInbound, SpeedtrapConfig, SpeedtrapDecision } from "./types.js";
 
 type SpeedtrapGlobalState = {
-  channels: Map<string, ChannelState>;
   agentRuns: Map<string, AgentRunState>;
 };
 
@@ -46,19 +40,15 @@ function getGlobalState(): SpeedtrapGlobalState {
     [GLOBAL_STATE_KEY]?: SpeedtrapGlobalState;
   };
   return (store[GLOBAL_STATE_KEY] ??= {
-    channels: new Map(),
     agentRuns: new Map(),
   });
 }
 
-// Shared across all coordinator instances so hooks firing from different
-// subsystems (gateway vs plugins) see the same state.
-const { channels, agentRuns } = getGlobalState();
+const { agentRuns } = getGlobalState();
 
 /** Reset shared state. Exported for tests only. */
 export function resetSharedState(): void {
   const state = getGlobalState();
-  state.channels.clear();
   state.agentRuns.clear();
 }
 
@@ -72,13 +62,18 @@ export class SpeedtrapCoordinator {
   }
 
   // ---------------------------------------------------------------------------
-  // message_received: increment channel message counter
+  // message_received: mark all active runs on this channel as dirty
   // ---------------------------------------------------------------------------
 
   onMessageReceived(channelKey: string): void {
-    const channel = this.ensureChannel(channelKey);
-    channel.messageCount++;
-    this.log(`Channel ${channelKey}: message received, count=${channel.messageCount}`);
+    let marked = 0;
+    for (const run of agentRuns.values()) {
+      if (run.channelKey === channelKey && run.active) {
+        run.channelDirty = true;
+        marked++;
+      }
+    }
+    this.log(`Channel ${channelKey}: message received, marked ${marked} active run(s) dirty`);
   }
 
   // ---------------------------------------------------------------------------
@@ -111,7 +106,6 @@ export class SpeedtrapCoordinator {
 
     for (const run of activeRuns) {
       this.pruneExpiredPending(run);
-      // Ring buffer: drop oldest if at capacity
       if (run.pending.length >= this.config.maxBufferedMessages) {
         run.pending.shift();
       }
@@ -123,18 +117,15 @@ export class SpeedtrapCoordinator {
   }
 
   // ---------------------------------------------------------------------------
-  // before_agent_start: snapshot channel message count
+  // before_agent_start: create run state
   // ---------------------------------------------------------------------------
 
   onAgentStart(agentId: string, channelKey: string): void {
-    const channel = this.ensureChannel(channelKey);
-    const snapshotMessageCount = channel.messageCount;
-
     const runKey = this.runKey(agentId, channelKey);
     agentRuns.set(runKey, {
       agentId,
       channelKey,
-      snapshotMessageCount,
+      channelDirty: false,
       hasWriteSideEffects: false,
       writeToolNames: [],
       reinjectCount: 0,
@@ -142,7 +133,7 @@ export class SpeedtrapCoordinator {
       pending: [],
     });
 
-    this.log(`Agent ${agentId} started on ${channelKey}, snapshot count=${snapshotMessageCount}`);
+    this.log(`Agent ${agentId} started on ${channelKey}`);
   }
 
   // ---------------------------------------------------------------------------
@@ -171,7 +162,6 @@ export class SpeedtrapCoordinator {
   getDecision(agentId: string, channelKey: string, draftResponse: string): SpeedtrapDecision {
     const runKey = this.runKey(agentId, channelKey);
     const run = agentRuns.get(runKey);
-    const channel = channels.get(channelKey);
 
     const preview = truncate(draftResponse, 200);
 
@@ -183,11 +173,8 @@ export class SpeedtrapCoordinator {
       return { action: "deliver" };
     }
 
-    const currentCount = channel?.messageCount ?? 0;
-    const channelMoved = currentCount > run.snapshotMessageCount;
-
     // A) Channel unchanged: deliver
-    if (!channelMoved) {
+    if (!run.channelDirty) {
       agentRuns.delete(runKey);
       this.log(
         `Agent ${agentId} completed on ${channelKey}: channel unchanged, delivering\n  response: ${preview}`,
@@ -212,6 +199,10 @@ export class SpeedtrapCoordinator {
     // Snapshot and consume this agent's pending buffer
     const pendingMessages = run.pending.length > 0 ? [...run.pending] : [];
     run.pending = [];
+
+    // Reset dirty flag: the agent is about to re-run with current context.
+    // If new messages arrive during the re-run, the flag will be set again.
+    run.channelDirty = false;
 
     // B) Channel moved + writes: reinject (mandatory)
     if (run.hasWriteSideEffects) {
@@ -279,15 +270,6 @@ export class SpeedtrapCoordinator {
       }
     }
     return active;
-  }
-
-  private ensureChannel(channelKey: string): ChannelState {
-    let channel = channels.get(channelKey);
-    if (!channel) {
-      channel = { channelKey, messageCount: 0 };
-      channels.set(channelKey, channel);
-    }
-    return channel;
   }
 
   private pruneExpiredPending(run: AgentRunState): void {
