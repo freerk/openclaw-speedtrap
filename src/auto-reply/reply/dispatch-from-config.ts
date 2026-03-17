@@ -416,7 +416,7 @@ export async function dispatchReplyFromConfig(params: {
   // by the plugin and never reaches the agent runner.
   const hasClaimHooks = hookRunner?.hasHooks("inbound_claim") ?? false;
   logVerbose(`dispatch-from-config: inbound_claim hooks present=${hasClaimHooks}`);
-  if (hasClaimHooks) {
+  if (hasClaimHooks && hookRunner) {
     const claimResult = await hookRunner.runInboundClaim(inboundClaimEvent, inboundClaimContext);
     logVerbose(
       `dispatch-from-config: inbound_claim result handled=${claimResult?.handled ?? false}`,
