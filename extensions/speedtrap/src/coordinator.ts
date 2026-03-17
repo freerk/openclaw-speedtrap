@@ -219,7 +219,12 @@ export class SpeedtrapCoordinator {
       this.pruneExpiredPending(channel);
     }
 
-    const pendingMessages = channel?.pending ?? [];
+    // Snapshot and consume pending buffer: the first agent to reinject
+    // gets the buffered messages, subsequent agents see an empty buffer.
+    const pendingMessages = channel?.pending ? [...channel.pending] : [];
+    if (channel && pendingMessages.length > 0) {
+      channel.pending = [];
+    }
 
     // B) Channel moved + writes → reinject (mandatory)
     if (run.hasWriteSideEffects) {
