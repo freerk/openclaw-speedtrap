@@ -1,9 +1,9 @@
 /**
  * Speedtrap — Types
  *
- * Minimal state model: per-channel message counters + per-agent-run metadata.
- * v2 adds coalescing: pending inbound buffer, claim gating, and richer
- * reinjection decisions when the channel moves during a run.
+ * Per-agent-run state model with dirty flag and pending buffer.
+ * Coalescing (v2): overlapping inbound messages are claimed and buffered
+ * per-agent, enabling reinject with full context.
  */
 
 export interface SpeedtrapConfig {
@@ -41,8 +41,17 @@ export const DEFAULT_CONFIG: SpeedtrapConfig = {
 /**
  * A buffered inbound message claimed while a run was active.
  */
-export interface PendingInbound {
+/** Inbound message shape as received from the hook (ts may be absent). */
+export interface PendingInboundInput {
   ts?: number;
+  sender?: string;
+  content: string;
+  messageId?: string;
+}
+
+/** Stored pending message with guaranteed timestamp. */
+export interface PendingInbound {
+  ts: number;
   sender?: string;
   content: string;
   messageId?: string;

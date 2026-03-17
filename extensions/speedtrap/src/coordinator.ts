@@ -27,7 +27,13 @@
  */
 
 import { isWriteTool } from "./classifier.js";
-import type { AgentRunState, PendingInbound, SpeedtrapConfig, SpeedtrapDecision } from "./types.js";
+import type {
+  AgentRunState,
+  PendingInbound,
+  PendingInboundInput,
+  SpeedtrapConfig,
+  SpeedtrapDecision,
+} from "./types.js";
 
 type SpeedtrapGlobalState = {
   agentRuns: Map<string, AgentRunState>;
@@ -85,7 +91,7 @@ export class SpeedtrapCoordinator {
    * When claimed, the message is appended to every active run on the channel
    * so each agent gets its own view of what happened while it was processing.
    */
-  onInboundClaim(channelKey: string, message: PendingInbound): boolean {
+  onInboundClaim(channelKey: string, message: PendingInboundInput): boolean {
     if (!this.config.coalesce || !this.config.claimWhileActive) {
       this.log(
         `Claim skip on ${channelKey}: coalesce=${this.config.coalesce} claimWhileActive=${this.config.claimWhileActive}`,
@@ -100,7 +106,9 @@ export class SpeedtrapCoordinator {
     }
 
     const entry: PendingInbound = {
-      ...message,
+      content: message.content,
+      sender: message.sender,
+      messageId: message.messageId,
       ts: message.ts ?? Date.now(),
     };
 
@@ -197,18 +205,24 @@ export class SpeedtrapCoordinator {
     }
 
     // Snapshot and consume this agent's pending buffer
-    const pendingMessages = run.pending.length > 0 ? [...run.pending] : [];
+    const pendingMessages = [...run.pending];
     run.pending = [];
 
     // Reset dirty flag: the agent is about to re-run with current context.
     // If new messages arrive during the re-run, the flag will be set again.
     run.channelDirty = false;
 
-    // B) Channel moved + writes: reinject (mandatory)
-    if (run.hasWriteSideEffects) {
+    // Should reinject? Writes always reinject. No writes but has pending: reinject.
+    const shouldReinject =
+      run.hasWriteSideEffects || (this.config.coalesce && pendingMessages.length > 0);
+
+    if (shouldReinject) {
       run.reinjectCount++;
+      const reason = run.hasWriteSideEffects
+        ? `has writes`
+        : `no writes, ${pendingMessages.length} pending`;
       this.log(
-        `Agent ${agentId} on ${channelKey}: channel moved, has writes, reinjecting (${run.reinjectCount}/${this.config.maxReinjects})\n  response: ${preview}`,
+        `Agent ${agentId} on ${channelKey}: channel moved, ${reason}, reinjecting (${run.reinjectCount}/${this.config.maxReinjects})\n  response: ${preview}`,
       );
       const context = this.config.coalesce
         ? buildCoalescedReinjectionPrompt(draftResponse, run.writeToolNames, pendingMessages)
@@ -216,17 +230,7 @@ export class SpeedtrapCoordinator {
       return { action: "reinject", context };
     }
 
-    // C) Channel moved + no writes + has pending: reinject with context
-    if (this.config.coalesce && pendingMessages.length > 0) {
-      run.reinjectCount++;
-      this.log(
-        `Agent ${agentId} on ${channelKey}: channel moved, no writes, ${pendingMessages.length} pending, reinjecting (${run.reinjectCount}/${this.config.maxReinjects})\n  response: ${preview}`,
-      );
-      const context = buildCoalescedReinjectionPrompt(draftResponse, [], pendingMessages);
-      return { action: "reinject", context };
-    }
-
-    // E) Channel moved + no writes + no pending: suppress
+    // Channel moved + no writes + no pending: suppress
     agentRuns.delete(runKey);
     this.log(
       `Agent ${agentId} completed on ${channelKey}: channel moved, no writes, suppressing\n  response: ${preview}`,
@@ -244,8 +248,8 @@ export class SpeedtrapCoordinator {
     event: { messages: unknown[]; success: boolean; durationMs?: number },
   ): void {
     const hasAssistantReply = event.messages.some(
-      (m) =>
-        typeof m === "object" && m !== null && (m as Record<string, unknown>).role === "assistant",
+      (m): m is Record<string, unknown> =>
+        typeof m === "object" && m !== null && "role" in m && m.role === "assistant",
     );
     if (!hasAssistantReply) {
       this.log(
@@ -274,7 +278,7 @@ export class SpeedtrapCoordinator {
 
   private pruneExpiredPending(run: AgentRunState): void {
     const cutoff = Date.now() - this.config.pendingTtlMs;
-    run.pending = run.pending.filter((p) => (p.ts ?? 0) >= cutoff);
+    run.pending = run.pending.filter((p) => p.ts >= cutoff);
   }
 }
 

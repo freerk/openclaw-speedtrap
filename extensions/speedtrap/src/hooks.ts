@@ -20,16 +20,31 @@ export function registerSpeedtrapHooks(api: OpenClawPluginApi): void {
   // registry at a time. All coordinator instances share state via globalThis
   // (see coordinator.ts).
 
-  const pluginCfg = (api.pluginConfig ?? {}) as Partial<SpeedtrapConfig>;
+  const pluginCfg = (api.pluginConfig ?? {}) as Record<string, unknown>;
   const config: SpeedtrapConfig = {
     assumeUnknownToolsAreWrites:
-      pluginCfg.assumeUnknownToolsAreWrites ?? DEFAULT_CONFIG.assumeUnknownToolsAreWrites,
-    debug: pluginCfg.debug ?? DEFAULT_CONFIG.debug,
-    maxReinjects: pluginCfg.maxReinjects ?? DEFAULT_CONFIG.maxReinjects,
-    coalesce: pluginCfg.coalesce ?? DEFAULT_CONFIG.coalesce,
-    claimWhileActive: pluginCfg.claimWhileActive ?? DEFAULT_CONFIG.claimWhileActive,
-    maxBufferedMessages: pluginCfg.maxBufferedMessages ?? DEFAULT_CONFIG.maxBufferedMessages,
-    pendingTtlMs: pluginCfg.pendingTtlMs ?? DEFAULT_CONFIG.pendingTtlMs,
+      typeof pluginCfg.assumeUnknownToolsAreWrites === "boolean"
+        ? pluginCfg.assumeUnknownToolsAreWrites
+        : DEFAULT_CONFIG.assumeUnknownToolsAreWrites,
+    debug: typeof pluginCfg.debug === "boolean" ? pluginCfg.debug : DEFAULT_CONFIG.debug,
+    maxReinjects:
+      typeof pluginCfg.maxReinjects === "number"
+        ? pluginCfg.maxReinjects
+        : DEFAULT_CONFIG.maxReinjects,
+    coalesce:
+      typeof pluginCfg.coalesce === "boolean" ? pluginCfg.coalesce : DEFAULT_CONFIG.coalesce,
+    claimWhileActive:
+      typeof pluginCfg.claimWhileActive === "boolean"
+        ? pluginCfg.claimWhileActive
+        : DEFAULT_CONFIG.claimWhileActive,
+    maxBufferedMessages:
+      typeof pluginCfg.maxBufferedMessages === "number"
+        ? pluginCfg.maxBufferedMessages
+        : DEFAULT_CONFIG.maxBufferedMessages,
+    pendingTtlMs:
+      typeof pluginCfg.pendingTtlMs === "number"
+        ? pluginCfg.pendingTtlMs
+        : DEFAULT_CONFIG.pendingTtlMs,
   };
 
   const log = (msg: string) => {
@@ -46,9 +61,6 @@ export function registerSpeedtrapHooks(api: OpenClawPluginApi): void {
   });
 
   api.on("inbound_claim", async (event, ctx) => {
-    log(
-      `inbound_claim hook fired: channelId=${ctx.channelId} conversationId=${ctx.conversationId}`,
-    );
     if (!ctx.channelId) return;
     const channelKey = buildPhysicalChannelKey(ctx.channelId, ctx.conversationId);
     const claimed = coordinator.onInboundClaim(channelKey, {
@@ -57,7 +69,6 @@ export function registerSpeedtrapHooks(api: OpenClawPluginApi): void {
       messageId: event.messageId,
       ts: event.timestamp,
     });
-    log(`inbound_claim result: channelKey=${channelKey} claimed=${claimed}`);
     if (claimed) {
       return { handled: true };
     }

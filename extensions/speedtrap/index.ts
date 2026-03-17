@@ -1,13 +1,14 @@
 /**
- * Speedtrap Plugin — Discard Stale Responses
+ * Speedtrap Plugin — Coalesced Stale-Response Handling
  *
  * If the channel moved while an agent was thinking, its response is stale.
- * Drop it, unless the agent executed write operations (reinject instead).
+ * With coalescing, overlapping messages are buffered per-agent and folded
+ * into the reinject context.
  *
- * Three outcomes:
- *   deliver  — channel unchanged, send response as-is
- *   suppress — channel moved + no writes, discard silently
- *   reinject — channel moved + writes, re-run with context
+ * Four outcomes:
+ *   deliver  — channel unchanged, or reinject budget exhausted
+ *   suppress — channel moved, no writes, no pending
+ *   reinject — channel moved + writes, or channel moved + pending
  */
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/speedtrap";
