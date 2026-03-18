@@ -1,16 +1,21 @@
 /**
  * Channel key normalization.
  *
- * Build a physical channel key from channelId + conversationId,
- * skipping accountId. All hooks receive both fields via context.
+ * Build a physical channel key from channelId + accountId + conversationId.
+ * Including accountId scopes state to the bot account that received the
+ * message, preventing cross-agent contamination in DMs (where different
+ * bots share the same conversationId for the same human user).
  *
- * Multi-agent setups use different accountIds for the same physical
- * channel (e.g. "slack:default:channel:C0..." vs "slack:conor:channel:C0...").
- * By keying on channelId + conversationId only, all agents see the same
- * physical channel regardless of which bot account they use.
+ * For shared channels, each bot account fires its own message_received
+ * and inbound_claim with its own accountId, so per-account scoping works
+ * naturally without special-casing DMs vs channels.
  */
 
-/** Build a physical channel key from hook context components (skip accountId). */
-export function buildPhysicalChannelKey(channelId: string, conversationId?: string): string {
-  return [channelId, conversationId].filter(Boolean).join(":");
+/** Build a physical channel key from hook context components. */
+export function buildPhysicalChannelKey(
+  channelId: string,
+  conversationId?: string,
+  accountId?: string,
+): string {
+  return [channelId, accountId, conversationId].filter(Boolean).join(":");
 }

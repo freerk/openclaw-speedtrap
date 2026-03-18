@@ -1342,6 +1342,8 @@ export type PluginHookAgentContext = {
   channelId?: string;
   /** Conversation target (e.g. group ID, DM address). */
   conversationId?: string;
+  /** Account id for multi-account channels (e.g. "conor", "default"). */
+  accountId?: string;
 };
 
 // before_model_resolve hook
