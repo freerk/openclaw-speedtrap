@@ -84,7 +84,7 @@ export function registerSpeedtrapHooks(api: OpenClawPluginApi): void {
     log(
       `before_agent_start: agentId=${ctx.agentId} accountId=${ctx.accountId} channelId=${ctx.channelId} conversationId=${ctx.conversationId}`,
     );
-    if (!ctx.agentId || !ctx.channelId) return;
+    if (!ctx.agentId || !ctx.channelId || !ctx.conversationId) return;
     const channelKey = buildPhysicalChannelKey(ctx.channelId, ctx.conversationId, ctx.accountId);
     coordinator.onAgentStart(ctx.agentId, channelKey);
   });
