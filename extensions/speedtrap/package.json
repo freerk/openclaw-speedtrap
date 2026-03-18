@@ -1,0 +1,16 @@
+{
+  "name": "@openclaw/speedtrap",
+  "version": "2026.3.8",
+  "description": "Discard stale agent responses when a channel moved during processing",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "install": {
+      "npmSpec": "@openclaw/speedtrap",
+      "localPath": "extensions/speedtrap",
+      "defaultChoice": "npm"
+    }
+  }
+}

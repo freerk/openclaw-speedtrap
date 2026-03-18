@@ -1,0 +1,62 @@
+{
+  "id": "speedtrap",
+  "name": "Speedtrap",
+  "description": "Coalesced stale-response handling: discard, reinject, or buffer overlapping agent responses when a channel moves during processing.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "assumeUnknownToolsAreWrites": {
+        "type": "boolean"
+      },
+      "debug": {
+        "type": "boolean"
+      },
+      "coalesce": {
+        "type": "boolean"
+      },
+      "claimWhileActive": {
+        "type": "boolean"
+      },
+      "maxBufferedMessages": {
+        "type": "integer"
+      },
+      "pendingTtlMs": {
+        "type": "integer"
+      },
+      "maxReinjects": {
+        "type": "integer"
+      }
+    }
+  },
+  "uiHints": {
+    "assumeUnknownToolsAreWrites": {
+      "label": "Unknown Tools = Writes",
+      "help": "When true, unrecognized tools are assumed to have write side effects. This forces delivery for unknown tool calls, which is safer than silently discarding. Default: true"
+    },
+    "debug": {
+      "label": "Debug Logging",
+      "help": "Log all Speedtrap decisions to console"
+    },
+    "coalesce": {
+      "label": "Coalescing",
+      "help": "Enable coalesced stale-response handling: buffer overlapping inbounds, reinject with follow-up context. Default: false"
+    },
+    "claimWhileActive": {
+      "label": "Claim While Active",
+      "help": "Claim overlapping inbound messages via inbound_claim while a run is active, preventing fan-out. Requires coalesce=true. Default: false"
+    },
+    "maxBufferedMessages": {
+      "label": "Max Buffered Messages",
+      "help": "Maximum pending inbound messages buffered per channel. Ring buffer: oldest dropped when full. Default: 20"
+    },
+    "pendingTtlMs": {
+      "label": "Pending TTL (ms)",
+      "help": "TTL for pending buffer entries in milliseconds. Expired entries are pruned. Default: 900000 (15 min)"
+    },
+    "maxReinjects": {
+      "label": "Max Reinjects",
+      "help": "Maximum reinject attempts before forcing delivery. Fail-safe to avoid loop starvation. Default: 3"
+    }
+  }
+}
