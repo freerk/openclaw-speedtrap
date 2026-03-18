@@ -14,6 +14,8 @@ export type AfterAgentCompleteHookContext = {
   channelKey: string;
   /** Conversation target (e.g. group ID, DM address). */
   conversationId?: string;
+  /** Account id for multi-account channels (e.g. "conor", "default"). */
+  accountId?: string;
   agentId: string;
   /** Factory to recreate the block reply pipeline on reinject iterations. */
   recreateBlockPipeline?: () => RunAgentTurnParams["blockReplyPipeline"];
@@ -75,6 +77,7 @@ export async function runAgentTurnWithHooks(
         sessionKey: params.sessionKey,
         channelId: hookCtx.channelId,
         conversationId: hookCtx.conversationId,
+        accountId: hookCtx.accountId,
       },
     );
 

@@ -380,6 +380,7 @@ export async function runReplyAgent(params: {
         channelId: hookChannelId,
         channelKey: hookChannelKey,
         conversationId: sessionCtx.To ?? undefined,
+        accountId: sessionCtx.AccountId ?? undefined,
         agentId: followupRun.run.agentId ?? "",
         recreateBlockPipeline:
           blockStreamingEnabled && opts?.onBlockReply
