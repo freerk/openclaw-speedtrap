@@ -56,11 +56,17 @@ export function registerSpeedtrapHooks(api: OpenClawPluginApi): void {
   const coordinator = new SpeedtrapCoordinator(config, log);
 
   api.on("message_received", async (_event, ctx) => {
+    log(
+      `message_received ctx: channelId=${ctx.channelId} accountId=${ctx.accountId} conversationId=${ctx.conversationId}`,
+    );
     const channelKey = buildPhysicalChannelKey(ctx.channelId, ctx.conversationId);
     coordinator.onMessageReceived(channelKey);
   });
 
   api.on("inbound_claim", async (event, ctx) => {
+    log(
+      `inbound_claim ctx: channelId=${ctx.channelId} accountId=${ctx.accountId} conversationId=${ctx.conversationId}`,
+    );
     if (!ctx.channelId) return;
     const channelKey = buildPhysicalChannelKey(ctx.channelId, ctx.conversationId);
     const claimed = coordinator.onInboundClaim(channelKey, {
@@ -75,6 +81,9 @@ export function registerSpeedtrapHooks(api: OpenClawPluginApi): void {
   });
 
   api.on("before_agent_start", async (_event, ctx) => {
+    log(
+      `before_agent_start ctx: agentId=${ctx.agentId} channelId=${ctx.channelId} conversationId=${ctx.conversationId}`,
+    );
     if (!ctx.agentId || !ctx.channelId) return;
     const channelKey = buildPhysicalChannelKey(ctx.channelId, ctx.conversationId);
     coordinator.onAgentStart(ctx.agentId, channelKey);
