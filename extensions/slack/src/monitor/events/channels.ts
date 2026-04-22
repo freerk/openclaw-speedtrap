@@ -1,8 +1,9 @@
 import type { SlackEventMiddlewareArgs } from "@slack/bolt";
-import { resolveChannelConfigWrites } from "../../../../../src/channels/plugins/config-writes.js";
-import { loadConfig, writeConfigFile } from "../../../../../src/config/config.js";
-import { danger, warn } from "../../../../../src/globals.js";
-import { enqueueSystemEvent } from "../../../../../src/infra/system-events.js";
+import { resolveChannelConfigWrites } from "openclaw/plugin-sdk/channel-config-writes";
+import { loadConfig, writeConfigFile } from "openclaw/plugin-sdk/config-runtime";
+import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { enqueueSystemEvent } from "openclaw/plugin-sdk/infra-runtime";
+import { danger, warn } from "openclaw/plugin-sdk/runtime-env";
 import { migrateSlackChannelConfig } from "../../channel-migration.js";
 import { resolveSlackChannelLabel } from "../channel-config.js";
 import type { SlackMonitorContext } from "../context.js";
@@ -61,7 +62,9 @@ export function registerSlackChannelEvents(params: {
         const channelName = payload.channel?.name;
         enqueueChannelSystemEvent({ kind: "created", channelId, channelName });
       } catch (err) {
-        ctx.runtime.error?.(danger(`slack channel created handler failed: ${String(err)}`));
+        ctx.runtime.error?.(
+          danger(`slack channel created handler failed: ${formatErrorMessage(err)}`),
+        );
       }
     },
   );
@@ -80,7 +83,9 @@ export function registerSlackChannelEvents(params: {
         const channelName = payload.channel?.name_normalized ?? payload.channel?.name;
         enqueueChannelSystemEvent({ kind: "renamed", channelId, channelName });
       } catch (err) {
-        ctx.runtime.error?.(danger(`slack channel rename handler failed: ${String(err)}`));
+        ctx.runtime.error?.(
+          danger(`slack channel rename handler failed: ${formatErrorMessage(err)}`),
+        );
       }
     },
   );
@@ -155,7 +160,9 @@ export function registerSlackChannelEvents(params: {
           );
         }
       } catch (err) {
-        ctx.runtime.error?.(danger(`slack channel_id_changed handler failed: ${String(err)}`));
+        ctx.runtime.error?.(
+          danger(`slack channel_id_changed handler failed: ${formatErrorMessage(err)}`),
+        );
       }
     },
   );

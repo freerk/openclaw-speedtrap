@@ -1,5 +1,14 @@
-import type { OpenClawConfig } from "../../../../src/config/config.js";
-import { logVerbose } from "../../../../src/globals.js";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
+
+type DiscordPreflightAudioRuntime = typeof import("./preflight-audio.runtime.js");
+
+let discordPreflightAudioRuntimePromise: Promise<DiscordPreflightAudioRuntime> | undefined;
+
+function loadDiscordPreflightAudioRuntime(): Promise<DiscordPreflightAudioRuntime> {
+  discordPreflightAudioRuntimePromise ??= import("./preflight-audio.runtime.js");
+  return discordPreflightAudioRuntimePromise;
+}
 
 type DiscordAudioAttachment = {
   content_type?: string;
@@ -50,8 +59,7 @@ export async function resolveDiscordPreflightAudioMentionContext(params: {
       };
     }
     try {
-      const { transcribeFirstAudio } =
-        await import("../../../../src/media-understanding/audio-preflight.js");
+      const { transcribeFirstAudio } = await loadDiscordPreflightAudioRuntime();
       if (params.abortSignal?.aborted) {
         return {
           hasAudioAttachment,

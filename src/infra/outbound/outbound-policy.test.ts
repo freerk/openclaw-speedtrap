@@ -1,93 +1,198 @@
-import { beforeEach, describe, expect, it } from "vitest";
-import { discordPlugin } from "../../../extensions/discord/src/channel.js";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { vi } from "vitest";
+import type { ChannelMessageActionName } from "../../channels/plugins/types.js";
 import type { OpenClawConfig } from "../../config/config.js";
-import { setActivePluginRegistry } from "../../plugins/runtime.js";
-import { createTestRegistry } from "../../test-utils/channel-plugins.js";
-import {
-  applyCrossContextDecoration,
-  buildCrossContextDecoration,
-  enforceCrossContextPolicy,
-  shouldApplyCrossContextMarker,
-} from "./outbound-policy.js";
 
-const slackConfig = {
+let applyCrossContextDecoration: typeof import("./outbound-policy.js").applyCrossContextDecoration;
+let buildCrossContextDecoration: typeof import("./outbound-policy.js").buildCrossContextDecoration;
+let enforceCrossContextPolicy: typeof import("./outbound-policy.js").enforceCrossContextPolicy;
+let shouldApplyCrossContextMarker: typeof import("./outbound-policy.js").shouldApplyCrossContextMarker;
+
+class TestTextDisplay {
+  constructor(readonly content: string) {}
+}
+
+class TestSeparator {
+  constructor(readonly options: { divider: boolean; spacing: string }) {}
+}
+
+class TestRichUiContainer {
+  constructor(readonly components: Array<TestTextDisplay | TestSeparator>) {}
+}
+
+const mocks = vi.hoisted(() => ({
+  getChannelMessageAdapter: vi.fn((channel: string) =>
+    channel === "richchat"
+      ? {
+          supportsComponentsV2: true,
+          buildCrossContextComponents: ({
+            originLabel,
+            message,
+          }: {
+            originLabel: string;
+            message: string;
+          }) => {
+            const trimmed = message.trim();
+            const components: Array<TestTextDisplay | TestSeparator> = [];
+            if (trimmed) {
+              components.push(new TestTextDisplay(message));
+              components.push(new TestSeparator({ divider: true, spacing: "small" }));
+            }
+            components.push(new TestTextDisplay(`*From ${originLabel}*`));
+            return [new TestRichUiContainer(components)];
+          },
+        }
+      : { supportsComponentsV2: false },
+  ),
+  normalizeTargetForProvider: vi.fn((channel: string, raw: string) => {
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    if (channel === "workspace") {
+      return trimmed.replace(/^#/, "");
+    }
+    return trimmed;
+  }),
+  lookupDirectoryDisplay: vi.fn(async ({ targetId }: { targetId: string }) =>
+    targetId.replace(/^#/, ""),
+  ),
+  formatTargetDisplay: vi.fn(
+    ({ target, display }: { target: string; display?: string }) => display ?? target,
+  ),
+}));
+
+vi.mock("./channel-adapters.js", () => ({
+  getChannelMessageAdapter: mocks.getChannelMessageAdapter,
+}));
+
+vi.mock("./target-normalization.js", () => ({
+  normalizeTargetForProvider: mocks.normalizeTargetForProvider,
+}));
+
+vi.mock("./target-resolver.js", () => ({
+  formatTargetDisplay: mocks.formatTargetDisplay,
+  lookupDirectoryDisplay: mocks.lookupDirectoryDisplay,
+}));
+
+const workspaceConfig = {
   channels: {
-    slack: {
-      botToken: "xoxb-test",
-      appToken: "xapp-test",
+    workspace: {
+      botToken: "workspace-test",
+      appToken: "workspace-app-test",
     },
   },
 } as OpenClawConfig;
 
-const discordConfig = {
+const richChatConfig = {
   channels: {
-    discord: {},
+    richchat: {},
   },
 } as OpenClawConfig;
 
+function expectCrossContextPolicyResult(params: {
+  cfg: OpenClawConfig;
+  channel: string;
+  action: "send" | "upload-file";
+  to: string;
+  currentChannelId: string;
+  currentChannelProvider: string;
+  expected: "allow" | RegExp;
+}) {
+  const run = () =>
+    enforceCrossContextPolicy({
+      cfg: params.cfg,
+      channel: params.channel,
+      action: params.action,
+      args: { to: params.to },
+      toolContext: {
+        currentChannelId: params.currentChannelId,
+        currentChannelProvider: params.currentChannelProvider,
+      },
+    });
+  if (params.expected === "allow") {
+    expect(run).not.toThrow();
+    return;
+  }
+  expect(run).toThrow(params.expected);
+}
+
 describe("outbound policy helpers", () => {
+  beforeAll(async () => {
+    ({
+      applyCrossContextDecoration,
+      buildCrossContextDecoration,
+      enforceCrossContextPolicy,
+      shouldApplyCrossContextMarker,
+    } = await import("./outbound-policy.js"));
+  });
+
   beforeEach(() => {
-    setActivePluginRegistry(
-      createTestRegistry([{ pluginId: "discord", plugin: discordPlugin, source: "test" }]),
-    );
+    vi.clearAllMocks();
   });
 
-  it("allows cross-provider sends when enabled", () => {
-    const cfg = {
-      ...slackConfig,
-      tools: {
-        message: { crossContext: { allowAcrossProviders: true } },
-      },
-    } as OpenClawConfig;
-
-    expect(() =>
-      enforceCrossContextPolicy({
-        cfg,
-        channel: "telegram",
-        action: "send",
-        args: { to: "telegram:@ops" },
-        toolContext: { currentChannelId: "C12345678", currentChannelProvider: "slack" },
-      }),
-    ).not.toThrow();
-  });
-
-  it("blocks cross-provider sends when not allowed", () => {
-    expect(() =>
-      enforceCrossContextPolicy({
-        cfg: slackConfig,
-        channel: "telegram",
-        action: "send",
-        args: { to: "telegram:@ops" },
-        toolContext: { currentChannelId: "C12345678", currentChannelProvider: "slack" },
-      }),
-    ).toThrow(/target provider "telegram" while bound to "slack"/);
-  });
-
-  it("blocks same-provider cross-context sends when allowWithinProvider is false", () => {
-    const cfg = {
-      ...slackConfig,
-      tools: {
-        message: { crossContext: { allowWithinProvider: false } },
-      },
-    } as OpenClawConfig;
-
-    expect(() =>
-      enforceCrossContextPolicy({
-        cfg,
-        channel: "slack",
-        action: "send",
-        args: { to: "C999" },
-        toolContext: { currentChannelId: "C123", currentChannelProvider: "slack" },
-      }),
-    ).toThrow(/target="C999" while bound to "C123"/);
+  it.each([
+    {
+      cfg: {
+        ...workspaceConfig,
+        tools: {
+          message: { crossContext: { allowAcrossProviders: true } },
+        },
+      } as OpenClawConfig,
+      channel: "forum",
+      action: "send" as const,
+      to: "forum:@ops",
+      currentChannelId: "C12345678",
+      currentChannelProvider: "workspace",
+      expected: "allow" as const,
+    },
+    {
+      cfg: workspaceConfig,
+      channel: "forum",
+      action: "send" as const,
+      to: "forum:@ops",
+      currentChannelId: "C12345678",
+      currentChannelProvider: "workspace",
+      expected: /target provider "forum" while bound to "workspace"/,
+    },
+    {
+      cfg: {
+        ...workspaceConfig,
+        tools: {
+          message: { crossContext: { allowWithinProvider: false } },
+        },
+      } as OpenClawConfig,
+      channel: "workspace",
+      action: "send" as const,
+      to: "C999",
+      currentChannelId: "C123",
+      currentChannelProvider: "workspace",
+      expected: /target="C999" while bound to "C123"/,
+    },
+    {
+      cfg: {
+        ...workspaceConfig,
+        tools: {
+          message: { crossContext: { allowWithinProvider: false } },
+        },
+      } as OpenClawConfig,
+      channel: "workspace",
+      action: "upload-file" as const,
+      to: "C999",
+      currentChannelId: "C123",
+      currentChannelProvider: "workspace",
+      expected: /target="C999" while bound to "C123"/,
+    },
+  ])("enforces cross-context policy for %j", (params) => {
+    expectCrossContextPolicyResult(params);
   });
 
   it("uses components when available and preferred", async () => {
     const decoration = await buildCrossContextDecoration({
-      cfg: discordConfig,
-      channel: "discord",
+      cfg: richChatConfig,
+      channel: "richchat",
       target: "123",
-      toolContext: { currentChannelId: "C12345678", currentChannelProvider: "discord" },
+      toolContext: { currentChannelId: "C12345678", currentChannelProvider: "richchat" },
     });
 
     expect(decoration).not.toBeNull();
@@ -106,12 +211,12 @@ describe("outbound policy helpers", () => {
   it("returns null when decoration is skipped and falls back to text markers", async () => {
     await expect(
       buildCrossContextDecoration({
-        cfg: discordConfig,
-        channel: "discord",
+        cfg: richChatConfig,
+        channel: "richchat",
         target: "123",
         toolContext: {
           currentChannelId: "C12345678",
-          currentChannelProvider: "discord",
+          currentChannelProvider: "richchat",
           skipCrossContextDecoration: true,
         },
       }),
@@ -128,9 +233,15 @@ describe("outbound policy helpers", () => {
     });
   });
 
-  it("marks only supported cross-context actions", () => {
-    expect(shouldApplyCrossContextMarker("send")).toBe(true);
-    expect(shouldApplyCrossContextMarker("thread-reply")).toBe(true);
-    expect(shouldApplyCrossContextMarker("thread-create")).toBe(false);
-  });
+  it.each([
+    { action: "send", expected: true },
+    { action: "upload-file", expected: true },
+    { action: "thread-reply", expected: true },
+    { action: "thread-create", expected: false },
+  ] satisfies Array<{ action: ChannelMessageActionName; expected: boolean }>)(
+    "marks supported cross-context action %j",
+    ({ action, expected }) => {
+      expect(shouldApplyCrossContextMarker(action)).toBe(expected);
+    },
+  );
 });

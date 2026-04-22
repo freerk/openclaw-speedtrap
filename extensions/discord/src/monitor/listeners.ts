@@ -8,16 +8,19 @@ import {
   ThreadUpdateListener,
   type User,
 } from "@buape/carbon";
-import type { OpenClawConfig } from "../../../../src/config/config.js";
-import { danger, logVerbose } from "../../../../src/globals.js";
-import { formatDurationSeconds } from "../../../../src/infra/format-time/format-duration.ts";
-import { enqueueSystemEvent } from "../../../../src/infra/system-events.js";
-import { createSubsystemLogger } from "../../../../src/logging/subsystem.js";
-import { resolveAgentRoute } from "../../../../src/routing/resolve-route.js";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import { enqueueSystemEvent } from "openclaw/plugin-sdk/infra-runtime";
+import { resolveAgentRoute } from "openclaw/plugin-sdk/routing";
+import {
+  createSubsystemLogger,
+  danger,
+  formatDurationSeconds,
+  logVerbose,
+} from "openclaw/plugin-sdk/runtime-env";
 import {
   readStoreAllowFromForDmPolicy,
   resolveDmGroupAccessWithLists,
-} from "../../../../src/security/dm-policy-shared.js";
+} from "openclaw/plugin-sdk/security-runtime";
 import {
   isDiscordGroupAllowedByPolicy,
   normalizeDiscordAllowList,
@@ -29,6 +32,7 @@ import {
   resolveDiscordGuildEntry,
   shouldEmitDiscordReactionNotification,
 } from "./allow-list.js";
+import { resolveDiscordChannelInfoSafe } from "./channel-access.js";
 import { formatDiscordReactionEmoji, formatDiscordUserTag } from "./format.js";
 import { resolveDiscordChannelInfo } from "./message-utils.js";
 import { setPresence } from "./presence-cache.js";
@@ -36,11 +40,9 @@ import { isThreadArchived } from "./thread-bindings.discord-api.js";
 import { closeDiscordThreadSessions } from "./thread-session-close.js";
 import { normalizeDiscordListenerTimeoutMs, runDiscordTaskWithTimeout } from "./timeouts.js";
 
-type LoadedConfig = ReturnType<typeof import("../../../../src/config/config.js").loadConfig>;
-type RuntimeEnv = import("../../../../src/runtime.js").RuntimeEnv;
-type Logger = ReturnType<
-  typeof import("../../../../src/logging/subsystem.js").createSubsystemLogger
->;
+type LoadedConfig = ReturnType<typeof import("openclaw/plugin-sdk/config-runtime").loadConfig>;
+type RuntimeEnv = import("openclaw/plugin-sdk/runtime-env").RuntimeEnv;
+type Logger = ReturnType<typeof import("openclaw/plugin-sdk/runtime-env").createSubsystemLogger>;
 
 export type DiscordMessageEvent = Parameters<MessageCreateListener["handle"]>[0];
 
@@ -444,9 +446,10 @@ async function handleDiscordReactionEvent(
     if (!channel) {
       return;
     }
-    const channelName = "name" in channel ? (channel.name ?? undefined) : undefined;
+    const channelInfo = resolveDiscordChannelInfoSafe(channel);
+    const channelName = channelInfo.name;
     const channelSlug = channelName ? normalizeDiscordSlug(channelName) : "";
-    const channelType = "type" in channel ? channel.type : undefined;
+    const channelType = channelInfo.type;
     const isDirectMessage = channelType === ChannelType.DM;
     const isGroupDm = channelType === ChannelType.GroupDM;
     const isThreadChannel =
@@ -454,7 +457,7 @@ async function handleDiscordReactionEvent(
       channelType === ChannelType.PrivateThread ||
       channelType === ChannelType.AnnouncementThread;
     const memberRoleIds = Array.isArray(data.rawMember?.roles)
-      ? data.rawMember.roles.map((roleId: string) => String(roleId))
+      ? data.rawMember.roles.map((roleId: string) => roleId)
       : [];
     const reactionIngressBase: Omit<DiscordReactionIngressAuthorizationParams, "channelConfig"> = {
       accountId: params.accountId,

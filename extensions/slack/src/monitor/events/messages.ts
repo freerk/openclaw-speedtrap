@@ -1,6 +1,7 @@
 import type { SlackEventMiddlewareArgs } from "@slack/bolt";
-import { danger } from "../../../../../src/globals.js";
-import { enqueueSystemEvent } from "../../../../../src/infra/system-events.js";
+import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { enqueueSystemEvent } from "openclaw/plugin-sdk/infra-runtime";
+import { danger } from "openclaw/plugin-sdk/runtime-env";
 import type { SlackAppMentionEvent, SlackMessageEvent } from "../../types.js";
 import { normalizeSlackChannelType } from "../channel-type.js";
 import type { SlackMonitorContext } from "../context.js";
@@ -43,7 +44,7 @@ export function registerSlackMessageEvents(params: {
 
       await handleSlackMessage(message, { source: "message" });
     } catch (err) {
-      ctx.runtime.error?.(danger(`slack handler failed: ${String(err)}`));
+      ctx.runtime.error?.(danger(`slack handler failed: ${formatErrorMessage(err)}`));
     }
   };
 
@@ -77,7 +78,7 @@ export function registerSlackMessageEvents(params: {
         wasMentioned: true,
       });
     } catch (err) {
-      ctx.runtime.error?.(danger(`slack mention handler failed: ${String(err)}`));
+      ctx.runtime.error?.(danger(`slack mention handler failed: ${formatErrorMessage(err)}`));
     }
   });
 }

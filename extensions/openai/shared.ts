@@ -1,65 +1,123 @@
-import { normalizeModelCompat } from "../../src/agents/model-compat.js";
-import type {
-  ProviderResolveDynamicModelContext,
-  ProviderRuntimeModel,
-} from "../../src/plugins/types.js";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import { findCatalogTemplate } from "openclaw/plugin-sdk/provider-catalog-shared";
+import {
+  cloneFirstTemplateModel,
+  matchesExactOrPrefix,
+  type ProviderPlugin,
+} from "openclaw/plugin-sdk/provider-model-shared";
+import { OPENAI_RESPONSES_STREAM_HOOKS } from "openclaw/plugin-sdk/provider-stream-family";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/text-runtime";
+import { buildOpenAIReplayPolicy } from "./replay-policy.js";
+import {
+  resolveOpenAITransportTurnState,
+  resolveOpenAIWebSocketSessionPolicy,
+} from "./transport-policy.js";
+
+type SyntheticOpenAIModelCatalogCost = {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+};
+
+type SyntheticOpenAIModelCatalogEntry = {
+  provider: string;
+  id: string;
+  name: string;
+  reasoning?: boolean;
+  input?: ("text" | "image")[];
+  contextWindow?: number;
+  contextTokens?: number;
+  cost?: SyntheticOpenAIModelCatalogCost;
+};
 
 export const OPENAI_API_BASE_URL = "https://api.openai.com/v1";
 
-export function matchesExactOrPrefix(id: string, values: readonly string[]): boolean {
-  const normalizedId = id.trim().toLowerCase();
-  return values.some((value) => {
-    const normalizedValue = value.trim().toLowerCase();
-    return normalizedId === normalizedValue || normalizedId.startsWith(normalizedValue);
-  });
+export function toOpenAIDataUrl(buffer: Buffer, mimeType: string): string {
+  return `data:${mimeType};base64,${buffer.toString("base64")}`;
 }
 
-export function isOpenAIApiBaseUrl(baseUrl?: string): boolean {
-  const trimmed = baseUrl?.trim();
-  if (!trimmed) {
-    return false;
+export function resolveConfiguredOpenAIBaseUrl(cfg: OpenClawConfig | undefined): string {
+  return normalizeOptionalString(cfg?.models?.providers?.openai?.baseUrl) ?? OPENAI_API_BASE_URL;
+}
+
+function hasSupportedOpenAIResponsesTransport(
+  transport: unknown,
+): transport is "auto" | "sse" | "websocket" {
+  return transport === "auto" || transport === "sse" || transport === "websocket";
+}
+
+export function defaultOpenAIResponsesExtraParams(
+  extraParams: Record<string, unknown> | undefined,
+  options?: { openaiWsWarmup?: boolean },
+): Record<string, unknown> | undefined {
+  const hasSupportedTransport = hasSupportedOpenAIResponsesTransport(extraParams?.transport);
+  const hasExplicitWarmup = typeof extraParams?.openaiWsWarmup === "boolean";
+  const shouldDefaultWarmup = options?.openaiWsWarmup === true;
+  if (hasSupportedTransport && (!shouldDefaultWarmup || hasExplicitWarmup)) {
+    return extraParams;
   }
-  return /^https?:\/\/api\.openai\.com(?:\/v1)?\/?$/i.test(trimmed);
+
+  return {
+    ...extraParams,
+    ...(hasSupportedTransport ? {} : { transport: "auto" }),
+    ...(shouldDefaultWarmup && !hasExplicitWarmup ? { openaiWsWarmup: true } : {}),
+  };
 }
 
-export function cloneFirstTemplateModel(params: {
-  providerId: string;
-  modelId: string;
-  templateIds: readonly string[];
-  ctx: ProviderResolveDynamicModelContext;
-  patch?: Partial<ProviderRuntimeModel>;
-}): ProviderRuntimeModel | undefined {
-  const trimmedModelId = params.modelId.trim();
-  for (const templateId of [...new Set(params.templateIds)].filter(Boolean)) {
-    const template = params.ctx.modelRegistry.find(
-      params.providerId,
-      templateId,
-    ) as ProviderRuntimeModel | null;
-    if (!template) {
-      continue;
-    }
-    return normalizeModelCompat({
-      ...template,
-      id: trimmedModelId,
-      name: trimmedModelId,
-      ...params.patch,
-    } as ProviderRuntimeModel);
+type OpenAIResponsesProviderHooks = Pick<
+  ProviderPlugin,
+  | "buildReplayPolicy"
+  | "prepareExtraParams"
+  | "wrapStreamFn"
+  | "resolveTransportTurnState"
+  | "resolveWebSocketSessionPolicy"
+>;
+
+const resolveOpenAIResponsesTransportTurnState: NonNullable<
+  OpenAIResponsesProviderHooks["resolveTransportTurnState"]
+> = (ctx) => resolveOpenAITransportTurnState(ctx);
+
+const resolveOpenAIResponsesWebSocketSessionPolicy: NonNullable<
+  OpenAIResponsesProviderHooks["resolveWebSocketSessionPolicy"]
+> = (ctx) => resolveOpenAIWebSocketSessionPolicy(ctx);
+
+export function buildOpenAIResponsesProviderHooks(options?: {
+  openaiWsWarmup?: boolean;
+}): OpenAIResponsesProviderHooks {
+  return {
+    buildReplayPolicy: buildOpenAIReplayPolicy,
+    prepareExtraParams: (ctx) => defaultOpenAIResponsesExtraParams(ctx.extraParams, options),
+    ...OPENAI_RESPONSES_STREAM_HOOKS,
+    resolveTransportTurnState: resolveOpenAIResponsesTransportTurnState,
+    resolveWebSocketSessionPolicy: resolveOpenAIResponsesWebSocketSessionPolicy,
+  };
+}
+
+export function buildOpenAISyntheticCatalogEntry(
+  template: ReturnType<typeof findCatalogTemplate>,
+  entry: {
+    id: string;
+    reasoning: boolean;
+    input: readonly ("text" | "image")[];
+    contextWindow: number;
+    contextTokens?: number;
+    cost?: SyntheticOpenAIModelCatalogCost;
+  },
+): SyntheticOpenAIModelCatalogEntry | undefined {
+  if (!template) {
+    return undefined;
   }
-  return undefined;
+  return {
+    ...template,
+    id: entry.id,
+    name: entry.id,
+    reasoning: entry.reasoning,
+    input: [...entry.input],
+    contextWindow: entry.contextWindow,
+    ...(entry.contextTokens === undefined ? {} : { contextTokens: entry.contextTokens }),
+    ...(entry.cost === undefined ? {} : { cost: entry.cost }),
+  };
 }
 
-export function findCatalogTemplate(params: {
-  entries: ReadonlyArray<{ provider: string; id: string }>;
-  providerId: string;
-  templateIds: readonly string[];
-}) {
-  return params.templateIds
-    .map((templateId) =>
-      params.entries.find(
-        (entry) =>
-          entry.provider.toLowerCase() === params.providerId.toLowerCase() &&
-          entry.id.toLowerCase() === templateId.toLowerCase(),
-      ),
-    )
-    .find((entry) => entry !== undefined);
-}
+export { cloneFirstTemplateModel, findCatalogTemplate, matchesExactOrPrefix };
